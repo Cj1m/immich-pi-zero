@@ -21,6 +21,10 @@ pub struct App {
     store: std::sync::Arc<crate::store::Store>,
     data_dir: std::path::PathBuf,
     web_root: std::path::PathBuf,
+    machine_learning_url: String,
+    machine_learning_enabled: bool,
+    config_file_locked: bool,
+    log_level_locked: bool,
 }
 
 impl App {
@@ -38,6 +42,22 @@ impl App {
 
     pub(crate) fn web_root(&self) -> &std::path::Path {
         &self.web_root
+    }
+
+    pub(crate) fn machine_learning_url(&self) -> &str {
+        &self.machine_learning_url
+    }
+
+    pub(crate) fn machine_learning_enabled(&self) -> bool {
+        self.machine_learning_enabled
+    }
+
+    pub(crate) fn config_file_locked(&self) -> bool {
+        self.config_file_locked
+    }
+
+    pub(crate) fn log_level_locked(&self) -> bool {
+        self.log_level_locked
     }
 
     pub(crate) async fn quota_size(&self, user_id: &str) -> Result<Option<i64>, DbError> {
@@ -69,6 +89,9 @@ impl App {
             .await?;
         }
         ensure_admin_onboarding(&pool).await?;
+        if let Some(path) = &config.config_file {
+            crate::system_config::install_config_file(&pool, path).await?;
+        }
         let dummy_password_hash =
             bcrypt::hash("immich-login-dummy", 10).map_err(StartupError::Hash)?;
         let store = crate::store::Store::open(config).map_err(StartupError::Io)?;
@@ -78,6 +101,10 @@ impl App {
             store: std::sync::Arc::new(store),
             data_dir: config.data_dir.clone(),
             web_root: config.web_root.clone(),
+            machine_learning_url: config.machine_learning_url.clone(),
+            machine_learning_enabled: config.machine_learning_enabled,
+            config_file_locked: config.config_file.is_some(),
+            log_level_locked: config.log_level.is_some(),
         })
     }
 

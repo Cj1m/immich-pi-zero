@@ -19,6 +19,10 @@ fn config(dir: &Path) -> Config {
         admin_password: Some("correct horse".to_string()),
         s3: None,
         web_root: dir.join("web"),
+        machine_learning_url: "http://immich-machine-learning:3003".to_string(),
+        machine_learning_enabled: true,
+        config_file: None,
+        log_level: None,
     }
 }
 

@@ -25,6 +25,10 @@ pub struct Config {
     pub admin_name: Option<String>,
     pub admin_password: Option<String>,
     pub s3: Option<S3Config>,
+    pub machine_learning_url: String,
+    pub machine_learning_enabled: bool,
+    pub config_file: Option<PathBuf>,
+    pub log_level: Option<String>,
 }
 
 impl Config {
@@ -51,6 +55,10 @@ impl Config {
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("web"));
+        let machine_learning_url = optional_env("IMMICH_MACHINE_LEARNING_URL")
+            .unwrap_or_else(|| "http://immich-machine-learning:3003".to_string());
+        let machine_learning_enabled =
+            optional_env("IMMICH_MACHINE_LEARNING_ENABLED").as_deref() != Some("false");
         Ok(Self {
             data_dir,
             web_root,
@@ -60,6 +68,10 @@ impl Config {
             admin_name: optional_env("IMMICH_ADMIN_NAME"),
             admin_password: optional_env("IMMICH_ADMIN_PASSWORD"),
             s3: s3_from_env()?,
+            machine_learning_url,
+            machine_learning_enabled,
+            config_file: optional_env("IMMICH_CONFIG_FILE").map(PathBuf::from),
+            log_level: optional_env("IMMICH_LOG_LEVEL"),
         })
     }
 
@@ -107,9 +119,11 @@ fn s3_from_env() -> Result<Option<S3Config>, StartupError> {
     if !missing.is_empty() {
         return Err(StartupError::MissingConfig { names: missing });
     }
-    let path_style = match optional_env("IMMICH_S3_PATH_STYLE") {
-        Some(value) => !matches!(value.as_str(), "0" | "false" | "FALSE"),
-        None => true,
+    let path_style = match optional_env("IMMICH_S3_FORCE_PATH_STYLE")
+        .or_else(|| optional_env("IMMICH_S3_PATH_STYLE"))
+    {
+        Some(value) => matches!(value.as_str(), "1" | "true" | "TRUE"),
+        None => false,
     };
     Ok(Some(S3Config {
         endpoint: endpoint.expect("checked"),

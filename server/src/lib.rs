@@ -4,12 +4,14 @@ mod albums;
 mod config;
 mod db;
 mod http;
+mod http_config;
 mod http_media;
 mod http_shares;
 mod media;
 mod shares;
 mod store;
 mod sync;
+mod system_config;
 mod thumbs;
 mod web;
 

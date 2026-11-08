@@ -26,6 +26,7 @@ pub fn router(app: App) -> Router {
         .route("/api/users/me", get(current_user))
         .route("/api/users/me/preferences", get(preferences))
         .route("/api/server/media-types", get(media_types))
+        .merge(crate::http_config::routes())
         .merge(crate::http_media::routes())
         .merge(crate::http_shares::routes())
         .fallback(crate::web::browser_document)
@@ -50,45 +51,21 @@ async fn version() -> Response {
     }))
 }
 
-async fn features() -> Response {
+async fn features(State(app): State<App>) -> Response {
     // `email` stays false (no mail is sent) and `realtimeTranscoding` stays false (no encoded video).
-    json_ok(json!({
-        "smartSearch": true,
-        "duplicateDetection": true,
-        "configFile": false,
-        "facialRecognition": true,
-        "map": true,
-        "trash": true,
-        "reverseGeocoding": true,
-        "importFaces": false,
-        "oauth": false,
-        "oauthAutoLaunch": false,
-        "passwordLogin": true,
-        "sidecar": true,
-        "search": true,
-        "email": false,
-        "ocr": true,
-        "realtimeTranscoding": false,
-    }))
+    let config = match app.admin_config().await {
+        Ok(config) => config,
+        Err(error) => return db_error(error),
+    };
+    json_ok(app.feature_flags(&config))
 }
 
 async fn server_config(State(app): State<App>) -> Response {
-    let is_onboarded = app.admin_onboarded().await;
-    json_ok(json!({
-        "loginPageMessage": "",
-        "trashDays": 30,
-        "userDeleteDelay": 7,
-        "oauthButtonText": "Login with OAuth",
-        "oauthAccountManagementUrl": "",
-        "isInitialized": true,
-        "isOnboarded": is_onboarded,
-        "externalDomain": "",
-        "publicUsers": true,
-        "mapDarkStyleUrl": "https://tiles.immich.cloud/v1/style/dark.json",
-        "mapLightStyleUrl": "https://tiles.immich.cloud/v1/style/light.json",
-        "maintenanceMode": false,
-        "minFaces": 3,
-    }))
+    let config = match app.admin_config().await {
+        Ok(config) => config,
+        Err(error) => return db_error(error),
+    };
+    json_ok(app.server_config_body(&config, app.admin_onboarded().await))
 }
 
 async fn login(State(app): State<App>, request: Request) -> Response {
