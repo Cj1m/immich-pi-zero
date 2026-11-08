@@ -541,6 +541,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 5 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V5.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (5)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -780,6 +798,46 @@ CREATE TABLE asset_clip (
     assetId TEXT PRIMARY KEY NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
     embedding BLOB NOT NULL
 );
+";
+
+const SCHEMA_V5: &str = "
+CREATE TABLE memory (
+    id TEXT PRIMARY KEY NOT NULL,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    deletedAt TEXT,
+    ownerId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    isSaved INTEGER NOT NULL DEFAULT 0,
+    memoryAt TEXT NOT NULL,
+    seenAt TEXT,
+    showAt TEXT,
+    hideAt TEXT,
+    updateId TEXT NOT NULL
+);
+CREATE INDEX memory_owner ON memory(ownerId, updateId);
+CREATE TABLE memory_asset (
+    memoryId TEXT NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    assetId TEXT NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+    updateId TEXT NOT NULL,
+    PRIMARY KEY (memoryId, assetId)
+);
+CREATE TABLE memory_audit (
+    id TEXT PRIMARY KEY NOT NULL,
+    memoryId TEXT NOT NULL,
+    ownerId TEXT NOT NULL,
+    updateId TEXT NOT NULL
+);
+CREATE INDEX memory_audit_owner ON memory_audit(ownerId, updateId);
+CREATE TABLE memory_asset_audit (
+    id TEXT PRIMARY KEY NOT NULL,
+    memoryId TEXT NOT NULL,
+    assetId TEXT NOT NULL,
+    ownerId TEXT NOT NULL,
+    updateId TEXT NOT NULL
+);
+CREATE INDEX memory_asset_audit_owner ON memory_asset_audit(ownerId, updateId);
 ";
 
 async fn user_count(pool: &SqlitePool) -> Result<i64, StartupError> {

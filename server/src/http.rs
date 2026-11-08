@@ -28,6 +28,7 @@ pub fn router(app: App) -> Router {
         .route("/api/server/media-types", get(media_types))
         .merge(crate::http_config::routes())
         .merge(crate::http_search::routes())
+        .merge(crate::http_memories::routes())
         .merge(crate::http_media::routes())
         .merge(crate::http_shares::routes())
         .fallback(crate::web::browser_document)

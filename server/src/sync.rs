@@ -115,6 +115,14 @@ impl App {
                     self.write_stacks(&mut body, user_id, &checkpoints, &now_id)
                         .await?
                 }
+                "MemoriesV2" => {
+                    self.write_memories(&mut body, user_id, &checkpoints, &now_id)
+                        .await?
+                }
+                "MemoryToAssetsV2" => {
+                    self.write_memory_assets(&mut body, user_id, &checkpoints, &now_id)
+                        .await?
+                }
                 _ => {}
             }
         }
@@ -485,6 +493,118 @@ impl App {
         Ok(())
     }
 
+    async fn write_memories(
+        &self,
+        body: &mut String,
+        user_id: &str,
+        checkpoints: &HashMap<String, String>,
+        now_id: &str,
+    ) -> Result<(), DbError> {
+        let deletes = self
+            .audit_ids(
+                "SELECT updateId, memoryId FROM memory_audit
+                 WHERE ownerId = ? AND (? IS NULL OR updateId > ?) AND updateId < ?
+                 ORDER BY updateId",
+                user_id,
+                cursor(checkpoints, "MemoryDeleteV1"),
+                now_id,
+            )
+            .await?;
+        for (update_id, memory_id) in deletes {
+            body.push_str(&sync_line(
+                "MemoryDeleteV1",
+                json!({ "memoryId": memory_id }),
+                &update_id,
+            ));
+        }
+        let rows = sqlx::query_as::<_, SyncMemory>(
+            "SELECT updateId AS update_id, id, createdAt AS created_at, updatedAt AS updated_at,
+                    deletedAt AS deleted_at, ownerId AS owner_id, type AS kind, data,
+                    isSaved AS is_saved, memoryAt AS memory_at, seenAt AS seen_at,
+                    showAt AS show_at, hideAt AS hide_at
+             FROM memory
+             WHERE ownerId = ? AND (? IS NULL OR updateId > ?) AND updateId < ?
+             ORDER BY updateId",
+        )
+        .bind(user_id)
+        .bind(cursor(checkpoints, "MemoryV2"))
+        .bind(cursor(checkpoints, "MemoryV2"))
+        .bind(now_id)
+        .fetch_all(self.pool())
+        .await?;
+        for memory in rows {
+            let data = serde_json::from_str::<Value>(&memory.data).unwrap_or_else(|_| json!({}));
+            body.push_str(&sync_line(
+                "MemoryV2",
+                json!({
+                    "id": memory.id,
+                    "createdAt": memory.created_at,
+                    "updatedAt": memory.updated_at,
+                    "deletedAt": memory.deleted_at,
+                    "ownerId": memory.owner_id,
+                    "type": memory.kind,
+                    "data": data,
+                    "isSaved": memory.is_saved != 0,
+                    "memoryAt": memory.memory_at,
+                    "seenAt": memory.seen_at,
+                    "showAt": memory.show_at,
+                    "hideAt": memory.hide_at,
+                }),
+                &memory.update_id,
+            ));
+        }
+        Ok(())
+    }
+
+    async fn write_memory_assets(
+        &self,
+        body: &mut String,
+        user_id: &str,
+        checkpoints: &HashMap<String, String>,
+        now_id: &str,
+    ) -> Result<(), DbError> {
+        let deletes: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT updateId, memoryId, assetId FROM memory_asset_audit
+             WHERE ownerId = ? AND (? IS NULL OR updateId > ?) AND updateId < ?
+             ORDER BY updateId",
+        )
+        .bind(user_id)
+        .bind(cursor(checkpoints, "MemoryToAssetDeleteV1"))
+        .bind(cursor(checkpoints, "MemoryToAssetDeleteV1"))
+        .bind(now_id)
+        .fetch_all(self.pool())
+        .await?;
+        for (update_id, memory_id, asset_id) in deletes {
+            body.push_str(&sync_line(
+                "MemoryToAssetDeleteV1",
+                json!({ "memoryId": memory_id, "assetId": asset_id }),
+                &update_id,
+            ));
+        }
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT memory_asset.updateId, memory_asset.memoryId, memory_asset.assetId
+             FROM memory_asset
+             JOIN memory ON memory.id = memory_asset.memoryId
+             WHERE memory.ownerId = ? AND (? IS NULL OR memory_asset.updateId > ?)
+               AND memory_asset.updateId < ?
+             ORDER BY memory_asset.updateId",
+        )
+        .bind(user_id)
+        .bind(cursor(checkpoints, "MemoryToAssetV2"))
+        .bind(cursor(checkpoints, "MemoryToAssetV2"))
+        .bind(now_id)
+        .fetch_all(self.pool())
+        .await?;
+        for (update_id, memory_id, asset_id) in rows {
+            body.push_str(&sync_line(
+                "MemoryToAssetV2",
+                json!({ "memoryId": memory_id, "assetId": asset_id }),
+                &update_id,
+            ));
+        }
+        Ok(())
+    }
+
     async fn user_sync_row(
         &self,
         user_id: &str,
@@ -525,6 +645,23 @@ impl App {
             .await?;
         Ok(rows)
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct SyncMemory {
+    update_id: String,
+    id: String,
+    created_at: String,
+    updated_at: String,
+    deleted_at: Option<String>,
+    owner_id: String,
+    kind: String,
+    data: String,
+    is_saved: i64,
+    memory_at: String,
+    seen_at: Option<String>,
+    show_at: Option<String>,
+    hide_at: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]

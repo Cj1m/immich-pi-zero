@@ -7,9 +7,11 @@ mod exif_meta;
 mod http;
 mod http_config;
 mod http_media;
+mod http_memories;
 mod http_search;
 mod http_shares;
 mod media;
+mod memories;
 mod ml;
 mod shares;
 mod store;
@@ -35,6 +37,10 @@ pub fn run() -> Result<(), StartupError> {
         .map_err(|error| StartupError::Io(std::io::Error::other(error)))?;
     runtime.block_on(async move {
         let app = App::prepare(&config).await?;
+        let jobs = app.clone();
+        tokio::spawn(async move {
+            memories::nightly_loop(jobs).await;
+        });
         let address = SocketAddr::new(config.host, config.port);
         let listener = tokio::net::TcpListener::bind(address)
             .await
