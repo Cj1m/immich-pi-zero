@@ -760,6 +760,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 13 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V13.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (13)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -1208,6 +1226,33 @@ CREATE TABLE partner_audit (
 );
 CREATE INDEX partner_audit_by ON partner_audit(sharedById);
 CREATE INDEX partner_audit_with ON partner_audit(sharedWithId);
+";
+
+const SCHEMA_V13: &str = "
+CREATE TABLE tag (
+    id TEXT PRIMARY KEY NOT NULL,
+    userId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    value TEXT NOT NULL,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    color TEXT,
+    parentId TEXT REFERENCES tag(id) ON DELETE CASCADE,
+    updateId TEXT NOT NULL,
+    UNIQUE (userId, value)
+);
+CREATE INDEX tag_update ON tag(updateId);
+CREATE TABLE tag_asset (
+    assetId TEXT NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+    tagId TEXT NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+    PRIMARY KEY (assetId, tagId)
+);
+CREATE INDEX tag_asset_tag ON tag_asset(tagId);
+CREATE TABLE tag_closure (
+    id_ancestor TEXT NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+    id_descendant TEXT NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+    PRIMARY KEY (id_ancestor, id_descendant)
+);
+CREATE INDEX tag_closure_descendant ON tag_closure(id_descendant);
 ";
 
 struct LiveSocket {

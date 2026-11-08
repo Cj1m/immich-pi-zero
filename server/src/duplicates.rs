@@ -59,6 +59,7 @@ struct SidecarSource {
     original_path: String,
     description: String,
     date_time_original: Option<String>,
+    time_zone: Option<String>,
     latitude: Option<f64>,
     longitude: Option<f64>,
     rating: Option<i64>,
@@ -198,6 +199,7 @@ impl App {
             "SELECT asset.originalPath AS original_path,
                     asset_exif.description AS description,
                     asset_exif.dateTimeOriginal AS date_time_original,
+                    asset_exif.timeZone AS time_zone,
                     asset_exif.latitude AS latitude,
                     asset_exif.longitude AS longitude,
                     asset_exif.rating AS rating,
@@ -358,7 +360,13 @@ impl App {
                 self.purge_asset(owner_id, id).await?;
             }
         }
-        if exif_changed {
+        let tags_changed = if merge {
+            self.merge_group_tags(owner_id, keep[0], &member_ids)
+                .await?
+        } else {
+            false
+        };
+        if exif_changed || tags_changed {
             if let Some(asset_id) = sidecar_id {
                 if let Err(error) = self.write_locked_sidecar(&asset_id).await {
                     eprintln!("sidecar write: {error:?}");
@@ -999,6 +1007,14 @@ fn is_uuid_v4(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|id| id.get_version() == Some(uuid::Version::Random))
 }
 
+pub(crate) fn append_locked(existing: Option<&str>, keys: &[&str]) -> String {
+    let mut locked = locked_list(existing);
+    for key in keys {
+        remember(&mut locked, key);
+    }
+    serde_json::to_string(&locked).unwrap_or_else(|_| "[]".to_string())
+}
+
 fn remember(locked: &mut Vec<String>, key: &str) {
     if !locked.iter().any(|item| item == key) {
         locked.push(key.to_string());
@@ -1028,9 +1044,20 @@ fn xmp_document(source: &SidecarSource, locked: &[String]) -> Option<String> {
     }
     if locked.iter().any(|key| key == "dateTimeOriginal") {
         if let Some(date) = &source.date_time_original {
+            let date = xml_escape(date);
             body.push_str(&format!(
-                "<photoshop:DateCreated>{}</photoshop:DateCreated>",
-                xml_escape(date)
+                "<photoshop:DateCreated>{date}</photoshop:DateCreated>"
+            ));
+            body.push_str(&format!(
+                "<exif:DateTimeOriginal>{date}</exif:DateTimeOriginal>"
+            ));
+        }
+    }
+    if locked.iter().any(|key| key == "timeZone") {
+        if let Some(zone) = &source.time_zone {
+            body.push_str(&format!(
+                "<exif:OffsetTimeOriginal>{}</exif:OffsetTimeOriginal>",
+                xml_escape(zone)
             ));
         }
     }
@@ -1052,13 +1079,11 @@ fn xmp_document(source: &SidecarSource, locked: &[String]) -> Option<String> {
     }
     if locked.iter().any(|key| key == "tags") {
         if let Some(tags) = tag_values(source.tags.as_deref()) {
-            if !tags.is_empty() {
-                body.push_str("<dc:subject><rdf:Bag>");
-                for tag in tags {
-                    body.push_str(&format!("<rdf:li>{}</rdf:li>", xml_escape(&tag)));
-                }
-                body.push_str("</rdf:Bag></dc:subject>");
+            body.push_str("<dc:subject><rdf:Bag>");
+            for tag in tags {
+                body.push_str(&format!("<rdf:li>{}</rdf:li>", xml_escape(&tag)));
             }
+            body.push_str("</rdf:Bag></dc:subject>");
         }
     }
     if body.is_empty() {

@@ -23,11 +23,15 @@ pub fn routes() -> Router<App> {
             "/api/assets",
             post(upload_asset)
                 .put(bulk_update_assets)
+                .patch(bulk_update_assets)
                 .delete(delete_assets),
         )
         .route("/api/assets/bulk-upload-check", post(bulk_upload_check))
         .route("/api/assets/jobs", post(asset_jobs))
-        .route("/api/assets/{id}", get(get_asset).put(update_asset))
+        .route(
+            "/api/assets/{id}",
+            get(get_asset).put(update_asset).patch(update_asset),
+        )
         .route("/api/assets/{id}/original", get(download_original))
         .route("/api/assets/{id}/thumbnail", get(download_thumbnail))
         .route("/api/sync/stream", post(sync_stream))

@@ -375,7 +375,9 @@ impl App {
         } else {
             None
         };
-        Ok(asset_json(record, stack))
+        let mut value = asset_json(record, stack);
+        value["tags"] = self.asset_tag_documents(&record.id).await?;
+        Ok(value)
     }
 
     pub async fn update_asset(
@@ -728,15 +730,68 @@ impl App {
             record.latitude = json_f64(body.get("latitude"));
             record.longitude = json_f64(body.get("longitude"));
         }
+        let mut lock_keys = Vec::new();
+        if has_latitude {
+            lock_keys.push("latitude");
+            lock_keys.push("longitude");
+        }
         if let Some(description) = body.get("description") {
-            record.description = Some(description.as_str().unwrap_or("").to_string());
+            let Some(description) = description.as_str() else {
+                return Err(DbError::Validation);
+            };
+            record.description = Some(description.to_string());
+            lock_keys.push("description");
         }
         if let Some(rating) = body.get("rating") {
             if rating.is_null() {
                 record.rating = None;
             } else {
-                record.rating = Some(rating.as_i64().ok_or(DbError::Validation)?);
+                let rating = rating.as_i64().ok_or(DbError::Validation)?;
+                if !matches!(rating, -1 | 1 | 2 | 3 | 4 | 5) {
+                    return Err(DbError::Validation);
+                }
+                record.rating = Some(rating);
             }
+            lock_keys.push("rating");
+        }
+        let has_original = body.get("dateTimeOriginal").is_some();
+        let has_relative = body.get("dateTimeRelative").is_some();
+        if has_original && has_relative {
+            return Err(DbError::Validation);
+        }
+        if has_original {
+            let Some(date) = body["dateTimeOriginal"].as_str() else {
+                return Err(DbError::Validation);
+            };
+            record.date_time_original = Some(date.to_string());
+            lock_keys.push("dateTimeOriginal");
+            if let Some(zone) = offset_of(date) {
+                record.time_zone = Some(zone);
+                lock_keys.push("timeZone");
+            }
+        }
+        if has_relative {
+            let minutes = body["dateTimeRelative"]
+                .as_i64()
+                .ok_or(DbError::Validation)?;
+            if minutes != 0 {
+                if let Some(current) = record.date_time_original.clone() {
+                    let parsed = chrono::DateTime::parse_from_rfc3339(&current)
+                        .map_err(|_| DbError::Validation)?;
+                    let shifted = parsed + chrono::Duration::minutes(minutes);
+                    record.date_time_original =
+                        Some(shifted.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+                }
+                lock_keys.push("dateTimeOriginal");
+                lock_keys.push("timeZone");
+            }
+        }
+        if let Some(zone) = body.get("timeZone") {
+            let Some(zone) = zone.as_str() else {
+                return Err(DbError::Validation);
+            };
+            record.time_zone = Some(zone.to_string());
+            lock_keys.push("timeZone");
         }
         let duplicate_id = match body.get("duplicateId") {
             None => record.duplicate_id.clone(),
@@ -745,6 +800,13 @@ impl App {
         };
         let now = now_iso();
         let update_id = new_update_id();
+        let existing_locked: Option<String> =
+            sqlx::query_scalar("SELECT lockedProperties FROM asset_exif WHERE assetId = ?")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?
+                .flatten();
+        let locked = crate::duplicates::append_locked(existing_locked.as_deref(), &lock_keys);
         sqlx::query(
             "UPDATE asset SET isFavorite = ?, visibility = ?, livePhotoVideoId = ?, duplicateId = ?, updatedAt = ?, updateId = ?
              WHERE id = ? AND ownerId = ?",
@@ -760,18 +822,78 @@ impl App {
         .execute(self.pool())
         .await?;
         sqlx::query(
-            "UPDATE asset_exif SET description = ?, latitude = ?, longitude = ?, rating = ?, updatedAt = ?, updateId = ?
+            "UPDATE asset_exif
+             SET description = ?, latitude = ?, longitude = ?, rating = ?,
+                 dateTimeOriginal = ?, timeZone = ?, lockedProperties = ?, updatedAt = ?, updateId = ?
              WHERE assetId = ?",
         )
         .bind(record.description.as_deref().unwrap_or(""))
         .bind(record.latitude)
         .bind(record.longitude)
         .bind(record.rating)
+        .bind(&record.date_time_original)
+        .bind(&record.time_zone)
+        .bind(&locked)
         .bind(&now)
         .bind(new_update_id())
         .bind(id)
         .execute(self.pool())
         .await?;
+        if body.get("visibility").and_then(Value::as_str) == Some("locked") {
+            self.detach_locked_asset(owner_id, id).await?;
+        }
+        if !lock_keys.is_empty() {
+            if let Err(error) = self.write_locked_sidecar(id).await {
+                eprintln!("sidecar write: {error:?}");
+            }
+        }
+        Ok(())
+    }
+
+    async fn detach_locked_asset(&self, owner_id: &str, asset_id: &str) -> Result<(), DbError> {
+        let albums: Vec<String> =
+            sqlx::query_scalar("SELECT albumId FROM album_asset WHERE assetId = ?")
+                .bind(asset_id)
+                .fetch_all(self.pool())
+                .await?;
+        for album_id in albums {
+            sqlx::query("DELETE FROM album_asset WHERE albumId = ? AND assetId = ?")
+                .bind(&album_id)
+                .bind(asset_id)
+                .execute(self.pool())
+                .await?;
+            sqlx::query("DELETE FROM activity WHERE albumId = ? AND assetId = ?")
+                .bind(&album_id)
+                .bind(asset_id)
+                .execute(self.pool())
+                .await?;
+            sqlx::query(
+                "INSERT INTO album_asset_audit (id, albumId, assetId, ownerId, updateId)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(new_id())
+            .bind(&album_id)
+            .bind(asset_id)
+            .bind(owner_id)
+            .bind(new_update_id())
+            .execute(self.pool())
+            .await?;
+            sqlx::query(
+                "UPDATE album
+                 SET albumThumbnailAssetId = CASE
+                       WHEN albumThumbnailAssetId = ? THEN NULL
+                       ELSE albumThumbnailAssetId
+                     END,
+                     updatedAt = ?, updateId = ?
+                 WHERE id = ?",
+            )
+            .bind(asset_id)
+            .bind(now_iso())
+            .bind(new_update_id())
+            .bind(&album_id)
+            .execute(self.pool())
+            .await?;
+        }
         Ok(())
     }
 
@@ -1266,6 +1388,17 @@ fn string_list(value: Option<&Value>) -> Result<Vec<String>, DbError> {
         ids.push(item.as_str().ok_or(DbError::Validation)?.to_string());
     }
     Ok(ids)
+}
+
+fn offset_of(value: &str) -> Option<String> {
+    if value.ends_with('Z') {
+        return Some("UTC".to_string());
+    }
+    let tail = value.get(value.len().saturating_sub(6)..)?;
+    if (tail.starts_with('+') || tail.starts_with('-')) && tail.as_bytes().get(3) == Some(&b':') {
+        return Some(tail.to_string());
+    }
+    None
 }
 
 fn json_f64(value: Option<&Value>) -> Option<f64> {
