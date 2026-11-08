@@ -1,5 +1,6 @@
 //! Admin user list, the new-user screen, both password calls, and web onboarding.
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -18,7 +19,16 @@ pub(crate) fn routes() -> Router<App> {
         .route("/api/admin/users/{id}/sessions", get(sessions))
         .route("/api/admin/users/{id}/preferences", get(user_preferences))
         .route("/api/admin/users/{id}/calendar-heatmap", get(heatmap))
-        .route("/api/admin/users/{id}", get(user_by_id))
+        .route(
+            "/api/admin/users/{id}",
+            get(user_by_id)
+                .put(update_user)
+                .patch(update_user)
+                .delete(delete_user),
+        )
+        .route("/api/admin/users/{id}/restore", post(restore_user))
+        .route("/api/socket.io", get(socket_io))
+        .route("/api/socket.io/", get(socket_io))
         .route("/api/auth/change-password", post(change_password))
         .route("/api/users/me/onboarding", put(set_onboarding))
         .route("/api/users/{id}/profile-image", get(profile_image))
@@ -151,6 +161,120 @@ async fn user_by_id(
     }
 }
 
+async fn update_user(State(app): State<App>, Path(id): Path<String>, request: Request) -> Response {
+    let headers = request.headers().clone();
+    let session = match admin_session(&app, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if uuid::Uuid::parse_str(&id).is_err() {
+        return message(StatusCode::BAD_REQUEST, "Validation failed");
+    }
+    let body = match read_json(request).await {
+        Ok(body) => body,
+        Err(text) => return message(StatusCode::BAD_REQUEST, text),
+    };
+    match app
+        .update_admin_user(&session.user.id, session.user.is_admin, &id, &body)
+        .await
+    {
+        Ok(user) => json_ok(user_json(&user)),
+        Err(error) => user_error(error),
+    }
+}
+
+async fn delete_user(State(app): State<App>, Path(id): Path<String>, request: Request) -> Response {
+    let headers = request.headers().clone();
+    let session = match admin_session(&app, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if uuid::Uuid::parse_str(&id).is_err() {
+        return message(StatusCode::BAD_REQUEST, "Validation failed");
+    }
+    let body = match read_json(request).await {
+        Ok(body) => body,
+        Err(text) => return message(StatusCode::BAD_REQUEST, text),
+    };
+    match app.delete_admin_user(&session.user.id, &id, &body).await {
+        Ok(user) => json_ok(user_json(&user)),
+        Err(error) => user_error(error),
+    }
+}
+
+async fn restore_user(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = admin_session(&app, &headers).await {
+        return response;
+    }
+    if uuid::Uuid::parse_str(&id).is_err() {
+        return message(StatusCode::BAD_REQUEST, "Validation failed");
+    }
+    match app.restore_admin_user(&id).await {
+        Ok(user) => json_ok(user_json(&user)),
+        Err(error) => user_error(error),
+    }
+}
+
+async fn socket_io(
+    State(app): State<App>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    if let Err(response) = require_session(&app, &headers).await {
+        return response;
+    }
+    upgrade.on_upgrade(move |socket| serve_socket(app, socket))
+}
+
+async fn serve_socket(app: App, mut socket: WebSocket) {
+    let open = format!(
+        "0{{\"sid\":\"{}\",\"upgrades\":[],\"pingInterval\":25000,\"pingTimeout\":20000,\"maxPayload\":1000000}}",
+        crate::db::new_id()
+    );
+    if socket.send(Message::Text(open.into())).await.is_err() {
+        return;
+    }
+    let mut events = app.subscribe_events();
+    let mut ready = false;
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        if text.as_str().starts_with('2') {
+                            if socket.send(Message::Text("3".into())).await.is_err() {
+                                break;
+                            }
+                        } else if text.as_str().starts_with("40") {
+                            ready = true;
+                            if socket.send(Message::Text("40".into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+            packet = events.recv() => {
+                let Some(packet) = packet else { break };
+                if ready && socket.send(Message::Text(packet.into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 async fn user_preferences(
     State(app): State<App>,
     Path(id): Path<String>,
@@ -278,9 +402,16 @@ async fn admin_onboarding(State(app): State<App>, request: Request) -> Response 
 }
 
 async fn require_admin(app: &App, headers: &HeaderMap) -> Result<(), Response> {
+    admin_session(app, headers).await.map(|_| ())
+}
+
+async fn admin_session(
+    app: &App,
+    headers: &HeaderMap,
+) -> Result<crate::db::CurrentSession, Response> {
     let session = require_session(app, headers).await?;
     if session.user.is_admin {
-        Ok(())
+        Ok(session)
     } else {
         Err(message(StatusCode::FORBIDDEN, "Forbidden"))
     }
@@ -290,6 +421,7 @@ fn user_error(error: UserFail) -> Response {
     match error {
         UserFail::Db(error) => db_error(error),
         UserFail::BadRequest(text) => message(StatusCode::BAD_REQUEST, text),
+        UserFail::Forbidden(text) => message(StatusCode::FORBIDDEN, text),
         UserFail::NotFound(text) => message(StatusCode::NOT_FOUND, text),
     }
 }

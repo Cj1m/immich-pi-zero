@@ -252,6 +252,23 @@ impl App {
         checkpoints: &HashMap<String, String>,
         now_id: &str,
     ) -> Result<(), DbError> {
+        let deletes: Vec<(String, String)> = sqlx::query_as(
+            "SELECT updateId, userId FROM user_audit
+             WHERE (? IS NULL OR updateId > ?) AND updateId < ?
+             ORDER BY updateId",
+        )
+        .bind(cursor(checkpoints, "UserDeleteV1"))
+        .bind(cursor(checkpoints, "UserDeleteV1"))
+        .bind(now_id)
+        .fetch_all(self.pool())
+        .await?;
+        for (update_id, deleted_id) in deletes {
+            body.push_str(&sync_line(
+                "UserDeleteV1",
+                json!({ "userId": deleted_id }),
+                &update_id,
+            ));
+        }
         // Invite-people reads every user, not only the caller.
         let users = self
             .changed_users(cursor(checkpoints, "UserV1"), now_id)

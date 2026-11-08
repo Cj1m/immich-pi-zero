@@ -1008,10 +1008,11 @@ impl App {
         let Some(album_id) = &row.album_id else {
             return Ok(false);
         };
-        let found: Option<String> = sqlx::query_scalar("SELECT id FROM album WHERE id = ?")
-            .bind(album_id)
-            .fetch_optional(self.pool())
-            .await?;
+        let found: Option<String> =
+            sqlx::query_scalar("SELECT id FROM album WHERE id = ? AND deletedAt IS NULL")
+                .bind(album_id)
+                .fetch_optional(self.pool())
+                .await?;
         Ok(found.is_some())
     }
 
@@ -1029,9 +1030,11 @@ impl App {
 
     async fn require_album_share(&self, user_id: &str, album_id: &str) -> Result<(), ApiError> {
         let allowed: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM album WHERE id = ? AND ownerId = ?
+            "SELECT 1 FROM album WHERE id = ? AND ownerId = ? AND deletedAt IS NULL
              UNION
-             SELECT 1 FROM album_user WHERE albumId = ? AND userId = ? AND role IN ('owner', 'editor')",
+             SELECT 1 FROM album
+             JOIN album_user ON album_user.albumId = album.id
+             WHERE album.id = ? AND album.deletedAt IS NULL AND album_user.userId = ? AND album_user.role IN ('owner', 'editor')",
         )
         .bind(album_id)
         .bind(user_id)
@@ -1074,9 +1077,11 @@ impl App {
 
     async fn can_read_album(&self, user_id: &str, album_id: &str) -> Result<bool, DbError> {
         let allowed: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM album WHERE id = ? AND ownerId = ?
+            "SELECT 1 FROM album WHERE id = ? AND ownerId = ? AND deletedAt IS NULL
              UNION
-             SELECT 1 FROM album_user WHERE albumId = ? AND userId = ?",
+             SELECT 1 FROM album
+             JOIN album_user ON album_user.albumId = album.id
+             WHERE album.id = ? AND album.deletedAt IS NULL AND album_user.userId = ?",
         )
         .bind(album_id)
         .bind(user_id)

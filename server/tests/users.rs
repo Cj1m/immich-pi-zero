@@ -1,6 +1,9 @@
 use std::net::IpAddr;
 use std::path::Path;
 
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
 use axum::body::Body;
 use http::Request;
 use http_body_util::BodyExt;
@@ -654,6 +657,838 @@ async fn admin_creates_a_later_user() {
     assert_eq!(server["isOnboarded"], true);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn admin_updates_deletes_and_restores_a_user() {
+    let dir = std::env::temp_dir().join(format!("immich-users-delete-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let app = App::prepare(&config(&dir)).await.expect("prepare");
+    let (_, admin_cookie) = login(
+        &app,
+        "admin@example.com",
+        "correct horse",
+        "Mozilla/5.0 Chrome/120.0.0.0",
+        "Mac",
+        "desktop",
+    )
+    .await;
+    let admin_id = user_id(&app, &admin_cookie).await;
+
+    let (status, body) = call(&app, json_request("GET", "/api/server/config", None, None)).await;
+    let server = json_body(&body);
+    assert_eq!(status, 200, "{server}");
+    assert_eq!(server["userDeleteDelay"], 7);
+
+    let guest_id = create_named(
+        &app,
+        &admin_cookie,
+        "guest@example.com",
+        "Guest",
+        "temp-pass",
+    )
+    .await;
+    let other_id = create_named(
+        &app,
+        &admin_cookie,
+        "other@example.com",
+        "Other",
+        "temp-pass",
+    )
+    .await;
+    let (_, guest_cookie) = login(
+        &app,
+        "guest@example.com",
+        "temp-pass",
+        "Mozilla/5.0 Chrome/120.0.0.0",
+        "Mac",
+        "desktop",
+    )
+    .await;
+
+    let (status, _) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            None,
+            Some(r#"{"name":"Nope"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 401);
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{admin_id}"),
+            Some(&guest_cookie),
+            Some(r#"{"name":"Nope"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 403, "{}", String::from_utf8_lossy(&body));
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            "/api/admin/users/not-a-uuid",
+            Some(&admin_cookie),
+            Some(r#"{"name":"Nope"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{}", json_body(&body)["message"]);
+    assert_eq!(json_body(&body)["message"], "Validation failed");
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"pinCode":"12345"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{}", json_body(&body));
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"quotaSizeInBytes":-1}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{}", json_body(&body));
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"quotaSizeInBytes":1.5}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{}", json_body(&body));
+
+    let asset_id = insert_original(&app, &dir, &guest_id).await;
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"quotaSizeInBytes":500}"#),
+        ),
+    )
+    .await;
+    let quoted = json_body(&body);
+    assert_eq!(status, 200, "{quoted}");
+    assert_eq!(quoted["quotaSizeInBytes"], 500);
+    assert_eq!(quoted["quotaUsageInBytes"], 100);
+    assert!(quoted.get("password").is_none());
+    assert!(quoted.get("pinCode").is_none());
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PATCH",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"email":" Guest.Two@Example.com ","name":"Renamed","storageLabel":"a/b:c"}"#),
+        ),
+    )
+    .await;
+    let renamed = json_body(&body);
+    assert_eq!(status, 200, "{renamed}");
+    assert_eq!(renamed["email"], "guest.two@example.com");
+    assert_eq!(renamed["name"], "Renamed");
+    assert_eq!(renamed["storageLabel"], "abc");
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"email":"admin@example.com"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{}", json_body(&body));
+    assert_eq!(json_body(&body)["message"], "Email is not available");
+    let (status, _) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{other_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"storageLabel":"taken"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"storageLabel":"taken"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{}", json_body(&body));
+    assert_eq!(
+        json_body(&body)["message"],
+        "Storage label already in use by another account"
+    );
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"storageLabel":""}"#),
+        ),
+    )
+    .await;
+    let cleared = json_body(&body);
+    assert_eq!(status, 200, "{cleared}");
+    assert!(cleared["storageLabel"].is_null());
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"password":"abcdefghijklmnop","shouldChangePassword":true}"#),
+        ),
+    )
+    .await;
+    let reset = json_body(&body);
+    assert_eq!(status, 200, "{reset}");
+    assert_eq!(reset["shouldChangePassword"], true);
+    let (_, guest_cookie) = login(
+        &app,
+        "guest.two@example.com",
+        "abcdefghijklmnop",
+        "Mozilla/5.0 Chrome/120.0.0.0",
+        "Mac",
+        "desktop",
+    )
+    .await;
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"pinCode":"123456"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", json_body(&body));
+    let pin = auth_pin(&app, &guest_cookie).await;
+    assert!(pin.as_str().unwrap().starts_with("$2"), "{pin}");
+    let (status, _) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"pinCode":null}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(auth_pin(&app, &guest_cookie).await.is_null());
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{admin_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"isAdmin":false}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{}", json_body(&body));
+    assert_eq!(
+        json_body(&body)["message"],
+        "Admin status can only be changed by another admin"
+    );
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"isAdmin":true}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", json_body(&body));
+    assert_eq!(json_body(&body)["isAdmin"], true);
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&guest_cookie),
+            Some(r#"{"isAdmin":false}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{}", json_body(&body));
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"isAdmin":false}"#),
+        ),
+    )
+    .await;
+    let demoted = json_body(&body);
+    assert_eq!(status, 200, "{demoted}");
+    assert_eq!(demoted["isAdmin"], false);
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/albums",
+            Some(&guest_cookie),
+            Some(r#"{"albumName":"Trip"}"#),
+        ),
+    )
+    .await;
+    let album = json_body(&body);
+    assert_eq!(status, 201, "{album}");
+    let album_id = album["id"].as_str().unwrap().to_string();
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/albums/{album_id}/users"),
+            Some(&guest_cookie),
+            Some(&format!(r#"{{"albumUsers":[{{"userId":"{admin_id}"}}]}}"#)),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", json_body(&body));
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/activities",
+            Some(&guest_cookie),
+            Some(&format!(
+                r#"{{"albumId":"{album_id}","type":"comment","comment":"hello"}}"#
+            )),
+        ),
+    )
+    .await;
+    assert_eq!(status, 201, "{}", json_body(&body));
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/shared-links",
+            Some(&guest_cookie),
+            Some(&format!(
+                r#"{{"type":"ALBUM","albumId":"{album_id}","slug":"trip"}}"#
+            )),
+        ),
+    )
+    .await;
+    let album_link = json_body(&body);
+    assert_eq!(status, 201, "{album_link}");
+    let album_key = album_link["key"].as_str().unwrap().to_string();
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/shared-links",
+            Some(&guest_cookie),
+            Some(&format!(
+                r#"{{"type":"INDIVIDUAL","assetIds":["{asset_id}"],"slug":"one"}}"#
+            )),
+        ),
+    )
+    .await;
+    let asset_link = json_body(&body);
+    assert_eq!(status, 201, "{asset_link}");
+    let asset_key = asset_link["key"].as_str().unwrap().to_string();
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/admin/users/{admin_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"force":false}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 403, "{}", json_body(&body));
+    assert_eq!(
+        json_body(&body)["message"],
+        "Cannot delete your own account"
+    );
+    let (status, body) = call(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"force":false}"#),
+        ),
+    )
+    .await;
+    let removed = json_body(&body);
+    assert_eq!(status, 200, "{removed}");
+    assert_eq!(removed["status"], "deleted");
+    assert!(removed["deletedAt"].is_string());
+
+    let (status, _) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(r#"{"email":"guest.two@example.com","password":"abcdefghijklmnop"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 401);
+    let (status, _) = call(
+        &app,
+        json_request("POST", "/api/auth/validateToken", Some(&guest_cookie), None),
+    )
+    .await;
+    assert_eq!(status, 401);
+    let (status, body) = call(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/admin/users/{guest_id}/sessions"),
+            Some(&admin_cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", json_body(&body));
+    assert_eq!(json_body(&body).as_array().unwrap().len(), 0);
+    let (status, body) = call(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/admin/users/{guest_id}/statistics"),
+            Some(&admin_cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", json_body(&body));
+    let (status, body) = call(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/admin/users/{guest_id}/preferences"),
+            Some(&admin_cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", json_body(&body));
+    let (status, body) = call(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/admin/users/{guest_id}/calendar-heatmap"),
+            Some(&admin_cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{}", json_body(&body));
+    assert_eq!(json_body(&body)["message"], "User not found");
+    assert!(!album_ids(&app, &admin_cookie).await.contains(&album_id));
+    let (status, _) = call(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/shared-links/me?key={album_key}"),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_ne!(status, 200);
+    let (status, _) = call(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/shared-links/me?key={asset_key}"),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, body) = call(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/activities?albumId={album_id}"),
+            Some(&admin_cookie),
+            None,
+        ),
+    )
+    .await;
+    let comments = json_body(&body);
+    assert_eq!(status, 200, "{comments}");
+    assert!(comments.as_array().unwrap().is_empty(), "{comments}");
+    let synced = sync_lines(&app, &admin_cookie, r#"{"types":["UsersV1"]}"#).await;
+    let guest_row = synced
+        .iter()
+        .find(|line| line["type"] == "UserV1" && line["data"]["id"] == guest_id)
+        .expect("guest");
+    assert!(guest_row["data"]["deletedAt"].is_string());
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/admin/users/{guest_id}/restore"),
+            Some(&admin_cookie),
+            None,
+        ),
+    )
+    .await;
+    let restored = json_body(&body);
+    assert_eq!(status, 200, "{restored}");
+    assert!(restored["deletedAt"].is_null());
+    assert_eq!(restored["status"], "active");
+    let _ = login(
+        &app,
+        "guest.two@example.com",
+        "abcdefghijklmnop",
+        "Mozilla/5.0 Chrome/120.0.0.0",
+        "Mac",
+        "desktop",
+    )
+    .await;
+    assert!(album_ids(&app, &admin_cookie).await.contains(&album_id));
+    let (status, _) = call(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/shared-links/me?key={album_key}"),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, body) = call(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/activities?albumId={album_id}"),
+            Some(&admin_cookie),
+            None,
+        ),
+    )
+    .await;
+    let comments = json_body(&body);
+    assert_eq!(status, 200, "{comments}");
+    assert_eq!(comments.as_array().unwrap().len(), 1, "{comments}");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = immich_server::router(app.clone());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, server).await;
+    });
+    let mut request = format!("ws://{addr}/api/socket.io/?EIO=4&transport=websocket")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("cookie", admin_cookie.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("socket");
+    let opened = next_text(&mut socket).await;
+    assert!(opened.starts_with('0'), "{opened}");
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text("40".into()))
+        .await
+        .unwrap();
+    let connected = next_text(&mut socket).await;
+    assert_eq!(connected, "40");
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/admin/users/{guest_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"force":true}"#),
+        ),
+    )
+    .await;
+    let forced = json_body(&body);
+    assert_eq!(status, 200, "{forced}");
+    assert_eq!(forced["status"], "removing");
+    assert!(forced["deletedAt"].is_string());
+    let event = next_text(&mut socket).await;
+    assert!(event.contains("on_user_delete"), "{event}");
+    assert!(event.contains(&guest_id), "{event}");
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user WHERE id = ?")
+        .bind(&guest_id)
+        .fetch_one(app.pool())
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+    let assets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM asset WHERE id = ?")
+        .bind(&asset_id)
+        .fetch_one(app.pool())
+        .await
+        .unwrap();
+    assert_eq!(assets, 0);
+    assert!(!dir
+        .join("objects")
+        .join(format!("{guest_id}/{asset_id}/original"))
+        .exists());
+    assert!(!dir.join("thumbs").join(&asset_id).exists());
+    assert!(!dir.join("profile").join(format!("{guest_id}.jpg")).exists());
+    assert!(!dir.join("encoded").join(format!("{asset_id}.mp4")).exists());
+    let deleted = sync_lines(
+        &app,
+        &admin_cookie,
+        r#"{"types":["UsersV1","AlbumsV2","AssetsV2"]}"#,
+    )
+    .await;
+    assert!(deleted
+        .iter()
+        .any(|line| { line["type"] == "UserDeleteV1" && line["data"]["userId"] == guest_id }));
+    assert!(deleted
+        .iter()
+        .any(|line| { line["type"] == "AlbumDeleteV1" && line["data"]["albumId"] == album_id }));
+    assert!(deleted.iter().all(|line| line["type"] != "AssetDeleteV1"));
+
+    let stale_id = create_named(
+        &app,
+        &admin_cookie,
+        "stale@example.com",
+        "Stale",
+        "temp-pass",
+    )
+    .await;
+    let (status, _) = call(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/admin/users/{stale_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"force":false}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    sqlx::query("UPDATE user SET deletedAt = '2020-01-01T00:00:00.000Z' WHERE id = ?")
+        .bind(&stale_id)
+        .execute(app.pool())
+        .await
+        .unwrap();
+    let fresh_id = create_named(
+        &app,
+        &admin_cookie,
+        "fresh@example.com",
+        "Fresh",
+        "temp-pass",
+    )
+    .await;
+    let (status, _) = call(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/admin/users/{fresh_id}"),
+            Some(&admin_cookie),
+            Some(r#"{"force":false}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    app.purge_expired_users().await.expect("purge");
+    let stale_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user WHERE id = ?")
+        .bind(&stale_id)
+        .fetch_one(app.pool())
+        .await
+        .unwrap();
+    let fresh_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user WHERE id = ?")
+        .bind(&fresh_id)
+        .fetch_one(app.pool())
+        .await
+        .unwrap();
+    assert_eq!(stale_left, 0);
+    assert_eq!(fresh_left, 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+async fn user_id(app: &App, cookie: &str) -> String {
+    let (status, body) = call(
+        app,
+        json_request("GET", "/api/users/me", Some(cookie), None),
+    )
+    .await;
+    let me = json_body(&body);
+    assert_eq!(status, 200, "{me}");
+    me["id"].as_str().unwrap().to_string()
+}
+
+async fn create_named(app: &App, cookie: &str, email: &str, name: &str, password: &str) -> String {
+    let (status, body) = call(
+        app,
+        json_request(
+            "POST",
+            "/api/admin/users",
+            Some(cookie),
+            Some(&format!(
+                r#"{{"email":"{email}","password":"{password}","name":"{name}"}}"#
+            )),
+        ),
+    )
+    .await;
+    let created = json_body(&body);
+    assert_eq!(status, 201, "{created}");
+    created["id"].as_str().unwrap().to_string()
+}
+
+async fn insert_original(app: &App, dir: &Path, owner_id: &str) -> String {
+    let asset_id = Uuid::new_v4().to_string();
+    let key = format!("{owner_id}/{asset_id}/original");
+    let object = dir.join("objects").join(&key);
+    std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+    std::fs::write(&object, b"original-bytes").unwrap();
+    let thumb = dir.join("thumbs").join(&asset_id);
+    std::fs::create_dir_all(&thumb).unwrap();
+    std::fs::write(thumb.join("thumbnail.jpg"), b"thumb").unwrap();
+    let profile = dir.join("profile").join(format!("{owner_id}.jpg"));
+    std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+    std::fs::write(&profile, b"face").unwrap();
+    let encoded = dir.join("encoded").join(format!("{asset_id}.mp4"));
+    std::fs::create_dir_all(encoded.parent().unwrap()).unwrap();
+    std::fs::write(&encoded, b"video").unwrap();
+    let now = "2020-06-01T00:00:00.000Z";
+    sqlx::query(
+        "INSERT INTO asset (
+            id, ownerId, type, originalPath, originalFileName, originalMimeType,
+            fileCreatedAt, fileModifiedAt, localDateTime, checksum, visibility,
+            createdAt, updatedAt, updateId
+        ) VALUES (?, ?, 'IMAGE', ?, 'a.jpg', 'image/jpeg', ?, ?, ?, ?, 'timeline', ?, ?, ?)",
+    )
+    .bind(&asset_id)
+    .bind(owner_id)
+    .bind(&key)
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .bind(vec![9_u8, 9, 9])
+    .bind(now)
+    .bind(now)
+    .bind(Uuid::now_v7().to_string())
+    .execute(app.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_exif (assetId, fileSizeInByte, description, updatedAt, updateId)
+         VALUES (?, 100, '', ?, ?)",
+    )
+    .bind(&asset_id)
+    .bind(now)
+    .bind(Uuid::now_v7().to_string())
+    .execute(app.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_file (id, assetId, type, path) VALUES (?, ?, 'encoded-video', ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&asset_id)
+    .bind(format!("encoded/{asset_id}.mp4"))
+    .execute(app.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE user SET profileImagePath = ? WHERE id = ?")
+        .bind(format!("profile/{owner_id}.jpg"))
+        .bind(owner_id)
+        .execute(app.pool())
+        .await
+        .unwrap();
+    asset_id
+}
+
+async fn auth_pin(app: &App, cookie: &str) -> Value {
+    let lines = sync_lines(app, cookie, r#"{"types":["AuthUsersV1"]}"#).await;
+    let row = lines
+        .iter()
+        .find(|line| line["type"] == "AuthUserV1")
+        .expect("auth user");
+    row["data"]["pinCode"].clone()
+}
+
+async fn album_ids(app: &App, cookie: &str) -> Vec<String> {
+    let (status, body) = call(app, json_request("GET", "/api/albums", Some(cookie), None)).await;
+    let albums = json_body(&body);
+    assert_eq!(status, 200, "{albums}");
+    albums
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|album| album["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+async fn sync_lines(app: &App, cookie: &str, body: &str) -> Vec<Value> {
+    let (status, bytes) = call(
+        app,
+        json_request("POST", "/api/sync/stream", Some(cookie), Some(body)),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
+    String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+async fn next_text(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> String {
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("socket timed out")
+        .expect("socket closed")
+        .expect("socket error");
+    message.to_text().expect("text").to_string()
 }
 
 async fn insert_assets(app: &App, owner_id: &str) {

@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-axum = { version = "0.8", features = ["multipart"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 base64 = "0.22"
 bcrypt = "0.17"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -28,6 +28,8 @@ uuid = { version = "1", features = ["v4", "v7"] }
 
 [dev-dependencies]
 axum = "0.8"
+futures-util = "0.3"
+tokio-tungstenite = "0.26"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 http = "1"

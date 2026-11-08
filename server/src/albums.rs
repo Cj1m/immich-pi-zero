@@ -89,7 +89,7 @@ impl App {
 
     pub async fn list_albums(&self, user_id: &str) -> Result<Value, DbError> {
         let sql = format!(
-            "{ALBUM_SQL} WHERE album.ownerId = ? OR album.id IN (SELECT albumId FROM album_user WHERE userId = ?) ORDER BY album.createdAt"
+            "{ALBUM_SQL} WHERE album.deletedAt IS NULL AND (album.ownerId = ? OR album.id IN (SELECT albumId FROM album_user WHERE userId = ?)) ORDER BY album.createdAt"
         );
         let rows = sqlx::query_as::<_, AlbumRow>(&sql)
             .bind(user_id)
@@ -202,6 +202,48 @@ impl App {
             .bind(id)
             .execute(self.pool())
             .await?;
+        Ok(())
+    }
+
+    /// Hard-delete every album this User owns, and tell each member.
+    pub(crate) async fn purge_owned_albums(&self, owner_id: &str) -> Result<(), DbError> {
+        let albums: Vec<String> = sqlx::query_scalar("SELECT id FROM album WHERE ownerId = ?")
+            .bind(owner_id)
+            .fetch_all(self.pool())
+            .await?;
+        for album_id in albums {
+            let users: Vec<String> =
+                sqlx::query_scalar("SELECT userId FROM album_user WHERE albumId = ?")
+                    .bind(&album_id)
+                    .fetch_all(self.pool())
+                    .await?;
+            for user_id in &users {
+                sqlx::query(
+                    "INSERT INTO album_user_audit (id, albumId, userId, ownerId, updateId) VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(new_id())
+                .bind(&album_id)
+                .bind(user_id)
+                .bind(owner_id)
+                .bind(new_update_id())
+                .execute(self.pool())
+                .await?;
+                // `ownerId` on this audit is the sync recipient, matching v3.3.6 `album_audit.userId`.
+                sqlx::query(
+                    "INSERT INTO album_audit (id, albumId, ownerId, updateId) VALUES (?, ?, ?, ?)",
+                )
+                .bind(new_id())
+                .bind(&album_id)
+                .bind(user_id)
+                .bind(new_update_id())
+                .execute(self.pool())
+                .await?;
+            }
+            sqlx::query("DELETE FROM album WHERE id = ?")
+                .bind(&album_id)
+                .execute(self.pool())
+                .await?;
+        }
         Ok(())
     }
 
@@ -437,7 +479,7 @@ impl App {
 
     async fn album_row(&self, user_id: &str, id: &str) -> Result<AlbumRow, DbError> {
         let sql = format!(
-            "{ALBUM_SQL} WHERE album.id = ? AND (album.ownerId = ? OR album.id IN (SELECT albumId FROM album_user WHERE userId = ?))"
+            "{ALBUM_SQL} WHERE album.deletedAt IS NULL AND album.id = ? AND (album.ownerId = ? OR album.id IN (SELECT albumId FROM album_user WHERE userId = ?))"
         );
         sqlx::query_as::<_, AlbumRow>(&sql)
             .bind(id)
@@ -449,7 +491,7 @@ impl App {
     }
 
     async fn album_row_by_id(&self, id: &str) -> Result<AlbumRow, DbError> {
-        let sql = format!("{ALBUM_SQL} WHERE album.id = ?");
+        let sql = format!("{ALBUM_SQL} WHERE album.deletedAt IS NULL AND album.id = ?");
         sqlx::query_as::<_, AlbumRow>(&sql)
             .bind(id)
             .fetch_optional(self.pool())
@@ -458,12 +500,13 @@ impl App {
     }
 
     async fn require_owner(&self, owner_id: &str, album_id: &str) -> Result<(), DbError> {
-        let id: Option<String> =
-            sqlx::query_scalar("SELECT id FROM album WHERE id = ? AND ownerId = ?")
-                .bind(album_id)
-                .bind(owner_id)
-                .fetch_optional(self.pool())
-                .await?;
+        let id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM album WHERE id = ? AND ownerId = ? AND deletedAt IS NULL",
+        )
+        .bind(album_id)
+        .bind(owner_id)
+        .fetch_optional(self.pool())
+        .await?;
         id.map(|_| ()).ok_or(DbError::NotFound)
     }
 

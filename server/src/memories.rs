@@ -53,6 +53,9 @@ async fn run_nightly(app: &App) {
         if let Err(error) = app.cleanup_memories(&stamp).await {
             eprintln!("memory cleanup: {error:?}");
         }
+        if let Err(error) = app.purge_expired_users().await {
+            eprintln!("user delete: {error:?}");
+        }
     }
 }
 

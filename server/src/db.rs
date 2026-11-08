@@ -25,6 +25,7 @@ pub struct App {
     machine_learning_enabled: bool,
     config_file_locked: bool,
     log_level_locked: bool,
+    events: LiveEvents,
 }
 
 impl App {
@@ -105,6 +106,7 @@ impl App {
             machine_learning_enabled: config.machine_learning_enabled,
             config_file_locked: config.config_file.is_some(),
             log_level_locked: config.log_level.is_some(),
+            events: LiveEvents::new(),
         };
         if let Err(error) = crate::ml::discard_mismatched_clip(&app).await {
             eprintln!("clip: {error}");
@@ -290,6 +292,14 @@ impl App {
         };
         let onboarded = user_is_onboarded(&self.pool, &row.id).await?;
         Ok(Some(row.into_document(onboarded)))
+    }
+
+    pub(crate) fn subscribe_events(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        self.events.subscribe()
+    }
+
+    pub(crate) fn broadcast_event(&self, packet: &str) {
+        self.events.broadcast(packet);
     }
 }
 
@@ -689,6 +699,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 10 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V10.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (10)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -1073,6 +1101,41 @@ CREATE TABLE asset_face_audit (
 );
 CREATE INDEX asset_face_audit_asset ON asset_face_audit(assetId);
 ";
+
+const SCHEMA_V10: &str = "
+ALTER TABLE album ADD COLUMN deletedAt TEXT;
+CREATE TABLE user_audit (
+    id TEXT PRIMARY KEY NOT NULL,
+    userId TEXT NOT NULL,
+    updateId TEXT NOT NULL
+);
+CREATE INDEX user_audit_update ON user_audit(updateId);
+";
+
+/// Socket.IO clients waiting for a server broadcast.
+#[derive(Clone)]
+struct LiveEvents {
+    sockets: std::sync::Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<String>>>>,
+}
+
+impl LiveEvents {
+    fn new() -> Self {
+        Self {
+            sockets: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        self.sockets.lock().expect("event list").push(sender);
+        receiver
+    }
+
+    fn broadcast(&self, packet: &str) {
+        let mut sockets = self.sockets.lock().expect("event list");
+        sockets.retain(|sender| sender.send(packet.to_string()).is_ok());
+    }
+}
 
 async fn user_count(pool: &SqlitePool) -> Result<i64, StartupError> {
     sqlx::query_scalar("SELECT COUNT(*) FROM user")
