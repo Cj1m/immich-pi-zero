@@ -577,6 +577,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 7 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V7.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (7)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -871,6 +889,22 @@ CREATE TABLE activity (
     updateId TEXT NOT NULL
 );
 CREATE INDEX activity_album ON activity(albumId, createdAt);
+";
+
+const SCHEMA_V7: &str = "
+CREATE TABLE geodata_places (
+    id INTEGER PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    alternateNames TEXT,
+    latitude REAL NOT NULL,
+    longitude REAL NOT NULL,
+    countryCode TEXT,
+    admin1Code TEXT,
+    admin2Code TEXT,
+    admin1Name TEXT,
+    admin2Name TEXT,
+    modificationDate TEXT
+);
 ";
 
 async fn user_count(pool: &SqlitePool) -> Result<i64, StartupError> {

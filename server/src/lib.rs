@@ -2,11 +2,13 @@
 
 mod activity;
 mod albums;
+mod browse;
 mod config;
 mod db;
 mod exif_meta;
 mod http;
 mod http_activity;
+mod http_browse;
 mod http_config;
 mod http_media;
 mod http_memories;
