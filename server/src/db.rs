@@ -595,6 +595,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 8 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V8.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (8)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -904,6 +922,62 @@ CREATE TABLE geodata_places (
     admin1Name TEXT,
     admin2Name TEXT,
     modificationDate TEXT
+);
+";
+
+const SCHEMA_V8: &str = "
+CREATE TABLE person_group (
+    id TEXT PRIMARY KEY NOT NULL,
+    clusterGroupId TEXT,
+    createdAt TEXT NOT NULL,
+    createId TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    updateId TEXT NOT NULL
+);
+CREATE TABLE person (
+    ownerId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    personGroupId TEXT NOT NULL REFERENCES person_group(id) ON DELETE CASCADE,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    thumbnailPath TEXT NOT NULL DEFAULT '',
+    isHidden INTEGER NOT NULL DEFAULT 0,
+    birthDate TEXT,
+    faceAssetId TEXT,
+    isFavorite INTEGER NOT NULL DEFAULT 0,
+    color TEXT,
+    updateId TEXT NOT NULL,
+    PRIMARY KEY (ownerId, personGroupId)
+);
+CREATE TABLE asset_face (
+    id TEXT PRIMARY KEY NOT NULL,
+    assetId TEXT NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+    personGroupId TEXT,
+    imageWidth INTEGER NOT NULL,
+    imageHeight INTEGER NOT NULL,
+    boundingBoxX1 INTEGER NOT NULL,
+    boundingBoxY1 INTEGER NOT NULL,
+    boundingBoxX2 INTEGER NOT NULL,
+    boundingBoxY2 INTEGER NOT NULL,
+    sourceType TEXT NOT NULL DEFAULT 'machine-learning',
+    deletedAt TEXT,
+    updatedAt TEXT NOT NULL,
+    updateId TEXT NOT NULL,
+    isVisible INTEGER NOT NULL DEFAULT 1,
+    ownerId TEXT NOT NULL,
+    assetVisibility TEXT NOT NULL,
+    assetDeletedAt TEXT
+);
+CREATE INDEX asset_face_person ON asset_face(personGroupId);
+CREATE TABLE person_user (
+    personGroupId TEXT NOT NULL,
+    sharedById TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    sharedWithId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    updateId TEXT NOT NULL,
+    PRIMARY KEY (personGroupId, sharedById, sharedWithId)
 );
 ";
 
