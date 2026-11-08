@@ -18,10 +18,10 @@ use crate::http::{cookie, db_error, json_ok, message, require_session};
 use crate::http_shares::{library_auth, share_params, ShareQuery};
 use crate::users::UserFail;
 
-struct Caller {
-    user_id: String,
-    session_id: Option<String>,
-    permissions: Option<Vec<String>>,
+pub(crate) struct Caller {
+    pub user_id: String,
+    pub session_id: Option<String>,
+    pub permissions: Option<Vec<String>>,
 }
 
 pub(crate) fn routes() -> Router<App> {
@@ -359,7 +359,7 @@ async fn caller_json(
     Ok((caller, body))
 }
 
-async fn account_caller(
+pub(crate) async fn account_caller(
     app: &App,
     headers: &HeaderMap,
     query: &str,

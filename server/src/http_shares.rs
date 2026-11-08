@@ -26,12 +26,15 @@ pub(crate) struct ShareQuery {
     pub with_coordinates: Option<String>,
     #[serde(rename = "withPartners")]
     pub with_partners: Option<String>,
+    pub visibility: Option<String>,
+    #[serde(rename = "userId")]
+    pub user_id: Option<String>,
     pub size: Option<String>,
 }
 
 pub(crate) enum LibraryAuth {
     Share(Viewer),
-    User(String),
+    User { user_id: String, elevated: bool },
 }
 
 pub(crate) fn routes() -> Router<App> {
@@ -86,20 +89,30 @@ pub(crate) async fn library_auth(
         return share_auth(app, false, &slug, allows_share).await;
     }
     let session = require_session(app, headers).await?;
-    Ok(LibraryAuth::User(session.user.id))
+    Ok(LibraryAuth::User {
+        user_id: session.user.id,
+        elevated: session.elevated,
+    })
 }
 
 pub(crate) fn user_id(auth: &LibraryAuth) -> &str {
     match auth {
         LibraryAuth::Share(viewer) => &viewer.user_id,
-        LibraryAuth::User(id) => id,
+        LibraryAuth::User { user_id, .. } => user_id,
+    }
+}
+
+pub(crate) fn elevated(auth: &LibraryAuth) -> bool {
+    match auth {
+        LibraryAuth::User { elevated, .. } => *elevated,
+        LibraryAuth::Share(_) => false,
     }
 }
 
 pub(crate) fn grant(auth: &LibraryAuth) -> Option<&ShareGrant> {
     match auth {
         LibraryAuth::Share(viewer) => Some(&viewer.share),
-        LibraryAuth::User(_) => None,
+        LibraryAuth::User { .. } => None,
     }
 }
 
@@ -129,7 +142,8 @@ async fn list_links(
     Query(query): Query<ShareQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let LibraryAuth::User(user_id) = (match library_auth(&app, &headers, &query, false).await {
+    let LibraryAuth::User { user_id, .. } = (match library_auth(&app, &headers, &query, false).await
+    {
         Ok(auth) => auth,
         Err(response) => return response,
     }) else {
@@ -161,7 +175,8 @@ async fn get_link(
     Query(query): Query<ShareQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let LibraryAuth::User(user_id) = (match library_auth(&app, &headers, &query, false).await {
+    let LibraryAuth::User { user_id, .. } = (match library_auth(&app, &headers, &query, false).await
+    {
         Ok(auth) => auth,
         Err(response) => return response,
     }) else {
@@ -190,7 +205,8 @@ async fn delete_link(
     Query(query): Query<ShareQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let LibraryAuth::User(user_id) = (match library_auth(&app, &headers, &query, false).await {
+    let LibraryAuth::User { user_id, .. } = (match library_auth(&app, &headers, &query, false).await
+    {
         Ok(auth) => auth,
         Err(response) => return response,
     }) else {
@@ -329,6 +345,9 @@ async fn timeline_buckets(
         album_id: query.album_id.as_deref(),
         order: query.order.as_deref().unwrap_or("desc"),
         with_partners,
+        visibility: query.visibility.as_deref(),
+        requested_user: query.user_id.as_deref(),
+        elevated: elevated(&auth),
     };
     match app.timeline_buckets(&request).await {
         Ok(body) => json_ok(body),
@@ -359,6 +378,9 @@ async fn timeline_bucket(
         album_id: query.album_id.as_deref(),
         order: query.order.as_deref().unwrap_or("desc"),
         with_partners,
+        visibility: query.visibility.as_deref(),
+        requested_user: query.user_id.as_deref(),
+        elevated: elevated(&auth),
     };
     match app
         .timeline_bucket(&request, &time_bucket, coordinates)
@@ -473,7 +495,7 @@ async fn require_link(
 ) -> Result<Viewer, Response> {
     match library_auth(app, headers, query, true).await? {
         LibraryAuth::Share(viewer) => Ok(viewer),
-        LibraryAuth::User(_) => Err(message(StatusCode::FORBIDDEN, "Forbidden")),
+        LibraryAuth::User { .. } => Err(message(StatusCode::FORBIDDEN, "Forbidden")),
     }
 }
 
@@ -484,7 +506,7 @@ async fn user_json(
 ) -> Result<(String, Value), Response> {
     let (auth, body) = auth_json(app, request, allows_share).await?;
     match auth {
-        LibraryAuth::User(id) => Ok((id, body)),
+        LibraryAuth::User { user_id, .. } => Ok((user_id, body)),
         LibraryAuth::Share(_) => Err(message(StatusCode::FORBIDDEN, "Forbidden")),
     }
 }

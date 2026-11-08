@@ -97,13 +97,7 @@ pub(crate) async fn signed_in(
     let share = ShareQuery {
         key: query_value(query, "key"),
         slug: query_value(query, "slug"),
-        album_id: None,
-        id: None,
-        order: None,
-        time_bucket: None,
-        with_coordinates: None,
-        with_partners: None,
-        size: None,
+        ..ShareQuery::default()
     };
     let share_header =
         headers.get("x-immich-share-key").is_some() || headers.get("x-immich-share-slug").is_some();

@@ -14,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::db::{App, DbError};
 use crate::http::{db_error, json_ok, message, require_session};
-use crate::http_shares::{grant, library_auth, user_id, LibraryAuth, ShareQuery};
+use crate::http_shares::{elevated, grant, library_auth, user_id, LibraryAuth, ShareQuery};
 use crate::media::{IncomingOriginal, IngestResult};
 
 pub fn routes() -> Router<App> {
@@ -66,7 +66,7 @@ async fn upload_asset(
     mut multipart: Multipart,
 ) -> Response {
     let (owner_id, share) = match library_auth(&app, &headers, &query, true).await {
-        Ok(LibraryAuth::User(id)) => (id, None),
+        Ok(LibraryAuth::User { user_id: id, .. }) => (id, None),
         Ok(LibraryAuth::Share(viewer)) => {
             if !viewer.share.allow_upload {
                 return message(StatusCode::UNAUTHORIZED, "Unauthorized");
@@ -301,6 +301,11 @@ async fn get_asset(
             Err(error) => db_error(error),
         };
     }
+    if let Err(response) =
+        reject_locked(&app, user_id(&auth), &id, elevated(&auth), "asset.read").await
+    {
+        return response;
+    }
     match app.asset_json(user_id(&auth), &id).await {
         Ok(body) => json_ok(body),
         Err(error) => db_error(error),
@@ -382,6 +387,10 @@ async fn download_original(
             }
             Err(error) => return db_error(error),
         }
+    } else if let Err(response) =
+        reject_locked(&app, user_id(&auth), &id, elevated(&auth), "asset.download").await
+    {
+        return response;
     }
     let range = headers
         .get(header::RANGE)
@@ -421,6 +430,10 @@ async fn download_thumbnail(
             }
             Err(error) => return db_error(error),
         }
+    } else if let Err(response) =
+        reject_locked(&app, user_id(&auth), &id, elevated(&auth), "asset.view").await
+    {
+        return response;
     }
     let size = query
         .size
@@ -436,6 +449,29 @@ async fn download_thumbnail(
         Ok(response) => response,
         Err(error) => db_error(error),
     }
+}
+
+async fn reject_locked(
+    app: &App,
+    owner_id: &str,
+    asset_id: &str,
+    elevated: bool,
+    permission: &str,
+) -> Result<(), Response> {
+    if elevated {
+        return Ok(());
+    }
+    let visibility = app
+        .asset_visibility(owner_id, asset_id)
+        .await
+        .map_err(db_error)?;
+    if visibility.as_deref() == Some("locked") {
+        return Err(message(
+            StatusCode::BAD_REQUEST,
+            format!("Not found or no {permission} access"),
+        ));
+    }
+    Ok(())
 }
 
 async fn sync_stream(State(app): State<App>, request: Request) -> Response {

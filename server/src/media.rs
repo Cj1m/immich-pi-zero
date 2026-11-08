@@ -266,6 +266,21 @@ impl App {
         Ok(IngestResult::Created(asset_id))
     }
 
+    pub(crate) async fn asset_visibility(
+        &self,
+        owner_id: &str,
+        id: &str,
+    ) -> Result<Option<String>, DbError> {
+        let visibility = sqlx::query_scalar(
+            "SELECT visibility FROM asset WHERE id = ? AND ownerId = ? AND deletedAt IS NULL",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(visibility)
+    }
+
     pub async fn asset_json(&self, owner_id: &str, id: &str) -> Result<Value, DbError> {
         let record = self.asset_record(owner_id, id).await?;
         self.asset_value(&record).await

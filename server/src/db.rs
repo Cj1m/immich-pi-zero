@@ -176,12 +176,46 @@ impl App {
             return Err(DbError::InvalidToken);
         }
         let onboarded = user_is_onboarded(&self.pool, &row.id).await?;
+        let (pin_expires_at, elevated) = self
+            .slide_pin(&row.session_id, row.session_pin_expires_at.clone())
+            .await?;
         Ok(CurrentSession {
             session_id: row.session_id.clone(),
             updated_at: row.session_updated_at.clone(),
             app_version: row.session_app_version.clone(),
+            expires_at: row.session_expires_at.clone(),
+            pin_expires_at,
+            elevated,
             user: row.into_user(onboarded),
         })
+    }
+
+    /// A PIN that expires inside five minutes is moved to five minutes from now.
+    async fn slide_pin(
+        &self,
+        session_id: &str,
+        current: Option<String>,
+    ) -> Result<(Option<String>, bool), DbError> {
+        let Some(current) = current.filter(|value| !value.is_empty()) else {
+            return Ok((None, false));
+        };
+        let Ok(expires) = DateTime::parse_from_rfc3339(&current) else {
+            return Ok((Some(current), false));
+        };
+        let expires = expires.with_timezone(&Utc);
+        let now = Utc::now();
+        let elevated = expires > now;
+        if elevated && now + chrono::Duration::minutes(5) > expires {
+            let next =
+                (now + chrono::Duration::minutes(5)).to_rfc3339_opts(SecondsFormat::Millis, true);
+            sqlx::query("UPDATE session SET pinExpiresAt = ? WHERE id = ?")
+                .bind(&next)
+                .bind(session_id)
+                .execute(&self.pool)
+                .await?;
+            return Ok((Some(next), true));
+        }
+        Ok((Some(current), elevated))
     }
 
     /// Server onboarding starts true, so the storage wizard does not run.
@@ -314,6 +348,8 @@ const SESSION_USER_SQL: &str = "SELECT
     session.id AS session_id,
     session.updatedAt AS session_updated_at,
     session.appVersion AS session_app_version,
+    session.expiresAt AS session_expires_at,
+    session.pinExpiresAt AS session_pin_expires_at,
     user.id, user.email, user.name, user.profileImagePath, user.avatarColor,
     user.profileChangedAt, user.clusterGroupId, user.storageLabel,
     user.shouldChangePassword, user.isAdmin, user.createdAt, user.deletedAt,
@@ -334,6 +370,9 @@ pub struct CurrentSession {
     pub session_id: String,
     pub updated_at: String,
     pub app_version: Option<String>,
+    pub expires_at: Option<String>,
+    pub pin_expires_at: Option<String>,
+    pub elevated: bool,
     pub user: UserDocument,
 }
 
@@ -421,6 +460,8 @@ struct SessionUser {
     session_id: String,
     session_updated_at: String,
     session_app_version: Option<String>,
+    session_expires_at: Option<String>,
+    session_pin_expires_at: Option<String>,
     id: String,
     email: String,
     name: String,

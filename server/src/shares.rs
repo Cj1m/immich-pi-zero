@@ -536,9 +536,10 @@ impl App {
     ) -> Result<Value, ApiError> {
         self.require_timeline_album(request.user_id, request.grant, request.album_id)
             .await?;
+        let locked = locked_timeline(request)?;
         let partners = timeline_partners(request);
         let desc = request.order != "asc";
-        let sql = bucket_month_sql(request.album_id.is_some(), partners, desc);
+        let sql = bucket_month_sql(request.album_id.is_some(), partners, desc, locked);
         let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
         query = match request.album_id {
             Some(album_id) => query.bind(album_id),
@@ -565,10 +566,11 @@ impl App {
             .await?;
         let show_place = request.grant.is_none_or(|grant| grant.show_metadata);
         let coordinates = with_coordinates && show_place;
+        let locked = locked_timeline(request)?;
         let partners = timeline_partners(request);
         let month = month_key(time_bucket);
         let desc = request.order != "asc";
-        let sql = bucket_asset_sql(request.album_id.is_some(), partners, desc);
+        let sql = bucket_asset_sql(request.album_id.is_some(), partners, desc, locked);
         let mut query = sqlx::query_as::<_, BucketAsset>(&sql).bind(month);
         query = match request.album_id {
             Some(album_id) => query.bind(album_id),
@@ -1146,8 +1148,9 @@ fn push_archive(
     ));
 }
 
-fn bucket_month_sql(album: bool, partners: bool, desc: bool) -> String {
+fn bucket_month_sql(album: bool, partners: bool, desc: bool, locked: bool) -> String {
     let direction = if desc { "DESC" } else { "ASC" };
+    let visibility = if locked { "locked" } else { "timeline" };
     let (from, filter) = if album {
         (
             "FROM asset JOIN album_asset ON album_asset.assetId = asset.id",
@@ -1161,14 +1164,15 @@ fn bucket_month_sql(album: bool, partners: bool, desc: bool) -> String {
     format!(
         "SELECT substr(asset.localDateTime, 1, 7) AS month, COUNT(*) AS count
          {from}
-         WHERE {filter} AND asset.deletedAt IS NULL AND asset.visibility = 'timeline'
+         WHERE {filter} AND asset.deletedAt IS NULL AND asset.visibility = '{visibility}'
          GROUP BY month
          ORDER BY month {direction}"
     )
 }
 
-fn bucket_asset_sql(album: bool, partners: bool, desc: bool) -> String {
+fn bucket_asset_sql(album: bool, partners: bool, desc: bool, locked: bool) -> String {
     let direction = if desc { "DESC" } else { "ASC" };
+    let visibility = if locked { "locked" } else { "timeline" };
     let (from, filter) = if album {
         (
             "FROM asset JOIN album_asset ON album_asset.assetId = asset.id",
@@ -1192,7 +1196,7 @@ fn bucket_asset_sql(album: bool, partners: bool, desc: bool) -> String {
          {from}
          LEFT JOIN asset_exif ON asset_exif.assetId = asset.id
          WHERE substr(asset.localDateTime, 1, 7) = ? AND {filter}
-           AND asset.deletedAt IS NULL AND asset.visibility = 'timeline'
+           AND asset.deletedAt IS NULL AND asset.visibility = '{visibility}'
          ORDER BY asset.localDateTime {direction}, asset.fileCreatedAt {direction},
                   asset.originalFileName {direction}"
     )
@@ -1306,6 +1310,37 @@ pub(crate) struct TimelineRequest<'a> {
     pub album_id: Option<&'a str>,
     pub order: &'a str,
     pub with_partners: bool,
+    pub visibility: Option<&'a str>,
+    pub requested_user: Option<&'a str>,
+    pub elevated: bool,
+}
+
+fn locked_timeline(request: &TimelineRequest<'_>) -> Result<bool, ApiError> {
+    if request.visibility != Some("locked") {
+        return Ok(false);
+    }
+    if !request.elevated {
+        return Err(ApiError::text(
+            StatusCode::UNAUTHORIZED,
+            "Elevated permission is required",
+        ));
+    }
+    if request.with_partners {
+        return Err(ApiError::text(
+            StatusCode::BAD_REQUEST,
+            "withPartners is only supported for non-archived, non-trashed, non-favorited, non-locked assets",
+        ));
+    }
+    if request
+        .requested_user
+        .is_some_and(|id| id != request.user_id)
+    {
+        return Err(ApiError::text(
+            StatusCode::BAD_REQUEST,
+            "You may not access another user's locked timeline",
+        ));
+    }
+    Ok(true)
 }
 
 fn timeline_partners(request: &TimelineRequest<'_>) -> bool {
