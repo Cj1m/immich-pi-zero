@@ -645,6 +645,11 @@ impl App {
             .and_then(Value::as_i64)
             .filter(|size| *size > 0)
             .unwrap_or(FOUR_GIB);
+        let preferences = self.preferences_for(user_id).await?;
+        let include_embedded = preferences
+            .pointer("/download/includeEmbeddedVideos")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let mut motion_ids = Vec::new();
         let mut archives = Vec::new();
         let mut current = Archive {
@@ -668,7 +673,7 @@ impl App {
                 continue;
             }
             if let Some(motion) = self.download_row(&motion_id).await? {
-                if motion.original_path.contains("encoded-video") {
+                if motion.original_path.contains("encoded-video") && !include_embedded {
                     continue;
                 }
                 push_archive(
@@ -696,20 +701,29 @@ impl App {
         user_id: &str,
         grant: Option<&ShareGrant>,
         asset_ids: &[String],
+        edited: bool,
     ) -> Result<Vec<u8>, ApiError> {
         if asset_ids.is_empty() {
             return Ok(write_zip(&[]));
         }
-        self.require_assets_download(user_id, grant, asset_ids)
-            .await?;
+        self.require_download_ids(user_id, grant, asset_ids).await?;
         let mut names = HashMap::new();
         let mut entries = Vec::new();
         for asset_id in asset_ids {
             let Some(row) = self.download_row(asset_id).await? else {
                 continue;
             };
-            let Some(bytes) = self.store().read_file(&row.original_path).await? else {
-                continue;
+            let edited_bytes = if edited {
+                self.fullsize_bytes(asset_id).await?
+            } else {
+                None
+            };
+            let bytes = match edited_bytes {
+                Some(bytes) => bytes,
+                None => match self.store().read_file(&row.original_path).await? {
+                    Some(bytes) => bytes,
+                    None => continue,
+                },
             };
             let filename = unique_name(&mut names, &sanitize_name(&row.original_file_name));
             entries.push((filename, bytes));
@@ -796,7 +810,7 @@ impl App {
     ) -> Result<Vec<DownloadRow>, ApiError> {
         if let Some(ids) = body.get("assetIds") {
             let ids = string_list(Some(ids));
-            self.require_assets_download(user_id, grant, &ids).await?;
+            self.require_download_ids(user_id, grant, &ids).await?;
             let mut rows = Vec::new();
             for id in ids {
                 if let Some(row) = self.download_row(&id).await? {
@@ -838,7 +852,7 @@ impl App {
                         asset.originalFileName AS original_file_name
                  FROM asset
                  LEFT JOIN asset_exif ON asset_exif.assetId = asset.id
-                 WHERE asset.ownerId = ? AND asset.deletedAt IS NULL AND asset.visibility = 'timeline'
+                 WHERE asset.ownerId = ? AND asset.deletedAt IS NULL AND asset.visibility != 'hidden'
                  ORDER BY asset.fileCreatedAt ASC",
             )
             .bind(user_id)
@@ -850,6 +864,52 @@ impl App {
             StatusCode::BAD_REQUEST,
             "assetIds, albumId, or userId is required",
         ))
+    }
+
+    /// A shared link still checks every id. A signed-in caller skips an id that has no row.
+    async fn require_download_ids(
+        &self,
+        user_id: &str,
+        grant: Option<&ShareGrant>,
+        ids: &[String],
+    ) -> Result<(), ApiError> {
+        if grant.is_some() {
+            return self.require_assets_download(user_id, grant, ids).await;
+        }
+        for id in ids {
+            let owner: Option<String> =
+                sqlx::query_scalar("SELECT ownerId FROM asset WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(self.pool())
+                    .await?;
+            if owner.is_some_and(|owner| owner != user_id) {
+                return Err(ApiError::text(
+                    StatusCode::BAD_REQUEST,
+                    "Not found or no asset.download access",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn fullsize_bytes(&self, asset_id: &str) -> Result<Option<Vec<u8>>, ApiError> {
+        let path: Option<String> = sqlx::query_scalar(
+            "SELECT path FROM asset_file WHERE assetId = ? AND type = 'fullsize'",
+        )
+        .bind(asset_id)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        let local = self.data_dir().join(&path);
+        if local.is_file() {
+            let bytes = tokio::fs::read(&local)
+                .await
+                .map_err(|error| DbError::Store(error.to_string()))?;
+            return Ok(Some(bytes));
+        }
+        Ok(self.store().read_file(&path).await?)
     }
 
     async fn require_assets_download(

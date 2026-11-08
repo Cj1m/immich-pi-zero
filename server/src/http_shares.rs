@@ -436,12 +436,15 @@ async fn download_archive(State(app): State<App>, request: Request) -> Response 
         .filter(|id| !id.is_empty())
         .map(str::to_string)
         .collect();
-    let archive_name = form_value(&form, "archiveName").unwrap_or_else(|| "immich".to_string());
-    let zip = match app.download_zip(user_id(&auth), grant(&auth), &ids).await {
+    let archive_name = form_value(&form, "archiveName");
+    let edited = form_value(&form, "edited").is_some_and(|value| value == "true");
+    let zip = match app
+        .download_zip(user_id(&auth), grant(&auth), &ids, edited)
+        .await
+    {
         Ok(bytes) => bytes,
         Err(error) => return from_api(error),
     };
-    let disposition = zip_disposition(&archive_name);
     let length = zip.len();
     let mut response = (
         StatusCode::OK,
@@ -454,8 +457,11 @@ async fn download_archive(State(app): State<App>, request: Request) -> Response 
         header::CONTENT_LENGTH,
         HeaderValue::from_str(&length.to_string()).expect("length"),
     );
-    if let Ok(value) = HeaderValue::from_str(&disposition) {
-        headers.insert(header::CONTENT_DISPOSITION, value);
+    if let Some(name) = archive_name {
+        let disposition = zip_disposition(&name);
+        if let Ok(value) = HeaderValue::from_str(&disposition) {
+            headers.insert(header::CONTENT_DISPOSITION, value);
+        }
     }
     response
 }

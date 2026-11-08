@@ -14,6 +14,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::db::{App, DbError};
 use crate::http::{db_error, json_ok, message, require_session};
+use crate::http_duplicates::signed_in;
 use crate::http_shares::{elevated, grant, library_auth, user_id, LibraryAuth, ShareQuery};
 use crate::media::{IncomingOriginal, IngestResult};
 
@@ -254,22 +255,22 @@ fn remove_temps(paths: &[PathBuf]) {
 }
 
 async fn bulk_upload_check(State(app): State<App>, request: Request) -> Response {
-    let (session, body) = match json_body(&app, request).await {
+    let (user_id, body) = match signed_json(&app, request).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    match app.bulk_upload_check(&session.user.id, &body).await {
+    match app.bulk_upload_check(&user_id, &body).await {
         Ok(body) => json_ok(body),
         Err(error) => db_error(error),
     }
 }
 
 async fn asset_jobs(State(app): State<App>, request: Request) -> Response {
-    let (session, body) = match json_body(&app, request).await {
+    let (user_id, body) = match signed_json(&app, request).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    match app.run_asset_job(&session.user.id, &body).await {
+    match app.run_asset_job(&user_id, &body).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => db_error(error),
     }
@@ -776,6 +777,21 @@ async fn create_stack(State(app): State<App>, request: Request) -> Response {
         Ok(body) => (StatusCode::CREATED, axum::Json(body)).into_response(),
         Err(error) => db_error(error),
     }
+}
+
+/// Session cookie, read after auth. A shared link is 403 before the body is parsed.
+async fn signed_json(app: &App, request: Request) -> Result<(String, Value), Response> {
+    let (parts, body) = request.into_parts();
+    let query = parts.uri.query().unwrap_or("").to_string();
+    let user_id = signed_in(app, &parts.headers, &query).await?;
+    let bytes = axum::body::to_bytes(body, 1024 * 1024)
+        .await
+        .map_err(|_| message(StatusCode::BAD_REQUEST, "Validation failed"))?;
+    let value = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+    if value.is_null() && !bytes.is_empty() {
+        return Err(message(StatusCode::BAD_REQUEST, "Validation failed"));
+    }
+    Ok((user_id, value))
 }
 
 async fn json_body(

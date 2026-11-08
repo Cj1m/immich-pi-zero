@@ -559,11 +559,29 @@ impl App {
             .get("name")
             .and_then(|value| value.as_str())
             .unwrap_or("");
+        if !matches!(
+            name,
+            "refresh-faces" | "refresh-metadata" | "regenerate-thumbnail" | "transcode-video"
+        ) {
+            return Err(DbError::Validation);
+        }
         let ids = string_list(body.get("assetIds"))?;
-        // `transcode-video` is accepted and writes no encoded video.
+        for id in &ids {
+            let owned: Option<String> =
+                sqlx::query_scalar("SELECT id FROM asset WHERE id = ? AND ownerId = ?")
+                    .bind(id)
+                    .bind(owner_id)
+                    .fetch_optional(self.pool())
+                    .await?;
+            if owned.is_none() {
+                return Err(DbError::BadRequest("Not found or no asset.update access"));
+            }
+        }
+        // Face detection stays off this machine. `transcode-video` writes no encoded video.
+        // Metadata is already read at upload. Thumbnail regeneration rewrites the local JPEG.
         if name == "regenerate-thumbnail" {
-            for id in ids {
-                let Ok(record) = self.asset_record(owner_id, &id).await else {
+            for id in &ids {
+                let Ok(record) = self.asset_record(owner_id, id).await else {
                     continue;
                 };
                 let source = self.data_dir().join("objects").join(&record.original_path);
