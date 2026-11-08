@@ -224,13 +224,15 @@ async fn socket_io(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    if let Err(response) = require_session(&app, &headers).await {
-        return response;
-    }
-    upgrade.on_upgrade(move |socket| serve_socket(app, socket))
+    let session = match require_session(&app, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let user_id = session.user.id;
+    upgrade.on_upgrade(move |socket| serve_socket(app, user_id, socket))
 }
 
-async fn serve_socket(app: App, mut socket: WebSocket) {
+async fn serve_socket(app: App, user_id: String, mut socket: WebSocket) {
     let open = format!(
         "0{{\"sid\":\"{}\",\"upgrades\":[],\"pingInterval\":25000,\"pingTimeout\":20000,\"maxPayload\":1000000}}",
         crate::db::new_id()
@@ -238,7 +240,7 @@ async fn serve_socket(app: App, mut socket: WebSocket) {
     if socket.send(Message::Text(open.into())).await.is_err() {
         return;
     }
-    let mut events = app.subscribe_events();
+    let mut events = app.subscribe_events(&user_id);
     let mut ready = false;
     loop {
         tokio::select! {

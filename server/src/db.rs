@@ -294,12 +294,19 @@ impl App {
         Ok(Some(row.into_document(onboarded)))
     }
 
-    pub(crate) fn subscribe_events(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
-        self.events.subscribe()
+    pub(crate) fn subscribe_events(
+        &self,
+        user_id: &str,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        self.events.subscribe(user_id)
     }
 
     pub(crate) fn broadcast_event(&self, packet: &str) {
         self.events.broadcast(packet);
+    }
+
+    pub(crate) fn send_user_event(&self, user_id: &str, packet: &str) {
+        self.events.send_user(user_id, packet);
     }
 }
 
@@ -717,6 +724,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 11 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V11.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (11)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -1112,10 +1137,46 @@ CREATE TABLE user_audit (
 CREATE INDEX user_audit_update ON user_audit(updateId);
 ";
 
+const SCHEMA_V11: &str = "
+CREATE TABLE api_key (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    key BLOB NOT NULL,
+    userId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    permissions TEXT NOT NULL,
+    updateId TEXT NOT NULL
+);
+CREATE INDEX api_key_key ON api_key(key);
+CREATE INDEX api_key_update ON api_key(updateId);
+CREATE TABLE notification (
+    id TEXT PRIMARY KEY NOT NULL,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    deletedAt TEXT,
+    updateId TEXT NOT NULL,
+    userId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    level TEXT NOT NULL DEFAULT 'info',
+    type TEXT NOT NULL DEFAULT 'info',
+    data TEXT,
+    title TEXT NOT NULL,
+    description TEXT,
+    readAt TEXT
+);
+CREATE INDEX notification_update ON notification(updateId);
+CREATE INDEX notification_user_created ON notification(userId, createdAt);
+";
+
+struct LiveSocket {
+    user_id: String,
+    sender: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
 /// Socket.IO clients waiting for a server broadcast.
 #[derive(Clone)]
 struct LiveEvents {
-    sockets: std::sync::Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    sockets: std::sync::Arc<std::sync::Mutex<Vec<LiveSocket>>>,
 }
 
 impl LiveEvents {
@@ -1125,15 +1186,28 @@ impl LiveEvents {
         }
     }
 
-    fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+    fn subscribe(&self, user_id: &str) -> tokio::sync::mpsc::UnboundedReceiver<String> {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        self.sockets.lock().expect("event list").push(sender);
+        self.sockets.lock().expect("event list").push(LiveSocket {
+            user_id: user_id.to_string(),
+            sender,
+        });
         receiver
     }
 
     fn broadcast(&self, packet: &str) {
         let mut sockets = self.sockets.lock().expect("event list");
-        sockets.retain(|sender| sender.send(packet.to_string()).is_ok());
+        sockets.retain(|socket| socket.sender.send(packet.to_string()).is_ok());
+    }
+
+    fn send_user(&self, user_id: &str, packet: &str) {
+        let mut sockets = self.sockets.lock().expect("event list");
+        sockets.retain(|socket| {
+            if socket.user_id != user_id {
+                return true;
+            }
+            socket.sender.send(packet.to_string()).is_ok()
+        });
     }
 }
 
@@ -1262,11 +1336,11 @@ fn age_hours(timestamp: &str) -> f64 {
     seconds as f64 / 3600.0
 }
 
-fn sha256(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn sha256(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
 }
 
-fn random_token() -> String {
+pub(crate) fn random_token() -> String {
     use base64::Engine;
     let mut bytes = [0_u8; 32];
     getrandom::fill(&mut bytes).expect("os random");

@@ -115,3 +115,35 @@ pub fn write_video_frame(data_dir: &Path, asset_id: &str, source: &Path) -> Opti
 pub fn remove_thumbs(data_dir: &Path, asset_id: &str) {
     let _ = std::fs::remove_dir_all(data_dir.join("thumbs").join(asset_id));
 }
+
+pub(crate) enum ProfileJpeg {
+    Wrote(std::path::PathBuf),
+    Undecodable,
+}
+
+/// Jpeg thumbnail under `{data}/profile/{userId}`, same edge as an asset thumbnail.
+pub(crate) fn write_profile_jpeg(
+    data_dir: &Path,
+    user_id: &str,
+    source: &Path,
+) -> std::io::Result<ProfileJpeg> {
+    let image = match image::ImageReader::open(source) {
+        Ok(reader) => match reader.with_guessed_format() {
+            Ok(reader) => match reader.decode() {
+                Ok(image) => image,
+                Err(_) => return Ok(ProfileJpeg::Undecodable),
+            },
+            Err(_) => return Ok(ProfileJpeg::Undecodable),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProfileJpeg::Undecodable);
+        }
+        Err(error) => return Err(error),
+    };
+    let directory = data_dir.join("profile").join(user_id);
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{}.jpg", crate::db::new_id()));
+    write_jpeg(&image.thumbnail(THUMB_EDGE, THUMB_EDGE), &path)
+        .ok_or_else(|| std::io::Error::other("profile thumbnail"))?;
+    Ok(ProfileJpeg::Wrote(path))
+}
