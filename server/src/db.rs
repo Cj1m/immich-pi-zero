@@ -111,6 +111,7 @@ impl App {
         if let Err(error) = crate::ml::discard_mismatched_clip(&app).await {
             eprintln!("clip: {error}");
         }
+        crate::plugins::import_configured_plugins(&app).await?;
         Ok(app)
     }
 
@@ -819,6 +820,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 14 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V14.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (14)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -1294,6 +1313,73 @@ CREATE TABLE tag_closure (
     PRIMARY KEY (id_ancestor, id_descendant)
 );
 CREATE INDEX tag_closure_descendant ON tag_closure(id_descendant);
+";
+
+const SCHEMA_V14: &str = "
+CREATE TABLE plugin (
+    id TEXT PRIMARY KEY NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    name TEXT NOT NULL UNIQUE,
+    version TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    author TEXT NOT NULL,
+    wasmBytes BLOB NOT NULL,
+    templates TEXT NOT NULL,
+    sha256hash BLOB NOT NULL,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    UNIQUE (name, version)
+);
+CREATE INDEX plugin_name ON plugin(name);
+CREATE TABLE plugin_method (
+    id TEXT PRIMARY KEY NOT NULL,
+    pluginId TEXT NOT NULL REFERENCES plugin(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    types TEXT NOT NULL,
+    hostFunctions INTEGER NOT NULL DEFAULT 0,
+    allowedHosts TEXT NOT NULL DEFAULT '[]',
+    schema TEXT,
+    uiHints TEXT NOT NULL DEFAULT '[]',
+    UNIQUE (pluginId, name)
+);
+CREATE INDEX plugin_method_plugin ON plugin_method(pluginId);
+CREATE TABLE workflow (
+    id TEXT PRIMARY KEY NOT NULL,
+    ownerId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    trigger TEXT NOT NULL,
+    name TEXT,
+    description TEXT,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    updateId TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    logging INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX workflow_owner ON workflow(ownerId);
+CREATE TABLE workflow_step (
+    id TEXT PRIMARY KEY NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    workflowId TEXT NOT NULL REFERENCES workflow(id) ON DELETE CASCADE,
+    pluginMethodId TEXT NOT NULL REFERENCES plugin_method(id) ON DELETE CASCADE,
+    config TEXT,
+    \"order\" INTEGER NOT NULL
+);
+CREATE INDEX workflow_step_workflow ON workflow_step(workflowId);
+CREATE INDEX workflow_step_method ON workflow_step(pluginMethodId);
+CREATE TABLE workflow_log (
+    id TEXT PRIMARY KEY NOT NULL,
+    createdAt TEXT NOT NULL,
+    workflowId TEXT NOT NULL REFERENCES workflow(id) ON DELETE CASCADE,
+    result TEXT NOT NULL,
+    workflowStepId TEXT REFERENCES workflow_step(id) ON DELETE SET NULL,
+    triggerDataId TEXT,
+    runId TEXT NOT NULL
+);
+CREATE INDEX workflow_log_workflow ON workflow_log(workflowId);
+CREATE INDEX workflow_log_step ON workflow_log(workflowStepId);
 ";
 
 struct LiveSocket {

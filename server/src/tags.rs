@@ -184,6 +184,15 @@ impl App {
     }
 
     pub async fn bulk_tag_assets(&self, user_id: &str, body: &Value) -> Result<Value, DbError> {
+        self.bulk_tag_assets_at(user_id, body, 0).await
+    }
+
+    pub(crate) async fn bulk_tag_assets_at(
+        &self,
+        user_id: &str,
+        body: &Value,
+        depth: u32,
+    ) -> Result<Value, DbError> {
         let tag_ids = uuid_list(body.get("tagIds"))?;
         let asset_ids = uuid_list(body.get("assetIds"))?;
         let mut count = 0;
@@ -221,6 +230,8 @@ impl App {
         for asset_id in &touched {
             self.store_asset_tags(asset_id).await?;
             self.write_tag_sidecar(asset_id).await;
+            self.run_asset_workflows_at(user_id, asset_id, "AssetTagged", depth)
+                .await;
         }
         Ok(json!({ "count": count }))
     }
@@ -262,6 +273,8 @@ impl App {
         for asset_id in &added {
             self.store_asset_tags(asset_id).await?;
             self.write_tag_sidecar(asset_id).await;
+            self.run_asset_workflows(user_id, asset_id, "AssetTagged")
+                .await;
         }
         Ok(Value::Array(results))
     }

@@ -263,6 +263,10 @@ impl App {
                 eprintln!("duplicate detection: {error:?}");
             }
         }
+        self.run_asset_workflows(owner_id, &asset_id, "AssetCreate")
+            .await;
+        self.run_asset_workflows(owner_id, &asset_id, "AssetMetadataExtraction")
+            .await;
         Ok(IngestResult::Created(asset_id))
     }
 
