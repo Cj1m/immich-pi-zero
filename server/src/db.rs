@@ -742,6 +742,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 12 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V12.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (12)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -1166,6 +1184,30 @@ CREATE TABLE notification (
 );
 CREATE INDEX notification_update ON notification(updateId);
 CREATE INDEX notification_user_created ON notification(userId, createdAt);
+";
+
+const SCHEMA_V12: &str = "
+CREATE TABLE partner (
+    sharedById TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    sharedWithId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    createdAt TEXT NOT NULL,
+    createId TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    inTimeline INTEGER NOT NULL DEFAULT 0,
+    updateId TEXT NOT NULL,
+    PRIMARY KEY (sharedById, sharedWithId)
+);
+CREATE INDEX partner_update ON partner(updateId);
+CREATE INDEX partner_create ON partner(createId);
+CREATE INDEX partner_with ON partner(sharedWithId);
+CREATE TABLE partner_audit (
+    id TEXT PRIMARY KEY NOT NULL,
+    sharedById TEXT NOT NULL,
+    sharedWithId TEXT NOT NULL,
+    deletedAt TEXT NOT NULL
+);
+CREATE INDEX partner_audit_by ON partner_audit(sharedById);
+CREATE INDEX partner_audit_with ON partner_audit(sharedWithId);
 ";
 
 struct LiveSocket {

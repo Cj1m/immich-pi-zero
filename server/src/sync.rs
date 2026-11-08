@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::db::{avatar_color_for_email, new_update_id, App, DbError};
-use crate::media::{sync_asset_json, sync_exif_json};
+use crate::media::{sync_asset_json, sync_exif_json, AssetRecord};
 
 const REQUEST_ORDER: &[&str] = &[
     "AuthUsersV1",
@@ -90,6 +90,32 @@ impl App {
                 "UsersV1" => {
                     self.write_user(&mut body, user_id, &checkpoints, &now_id)
                         .await?;
+                }
+                "PartnersV1" => {
+                    self.write_partners(&mut body, user_id, &checkpoints, &now_id)
+                        .await?;
+                }
+                "PartnerAssetsV2" => {
+                    self.write_partner_library(
+                        &mut body,
+                        session_id,
+                        user_id,
+                        &checkpoints,
+                        &now_id,
+                        false,
+                    )
+                    .await?;
+                }
+                "PartnerAssetExifsV1" => {
+                    self.write_partner_library(
+                        &mut body,
+                        session_id,
+                        user_id,
+                        &checkpoints,
+                        &now_id,
+                        true,
+                    )
+                    .await?;
                 }
                 "AssetsV2" => {
                     self.write_assets(&mut body, user_id, &checkpoints, &now_id)
@@ -280,6 +306,184 @@ impl App {
                 &user.update_id,
             ));
         }
+        Ok(())
+    }
+
+    async fn write_partners(
+        &self,
+        body: &mut String,
+        user_id: &str,
+        checkpoints: &HashMap<String, String>,
+        now_id: &str,
+    ) -> Result<(), DbError> {
+        let deletes: Vec<SyncPartnerDelete> = sqlx::query_as(
+            "SELECT id, sharedById AS shared_by_id, sharedWithId AS shared_with_id
+             FROM partner_audit
+             WHERE (sharedById = ? OR sharedWithId = ?)
+               AND (? IS NULL OR id > ?) AND id < ?
+             ORDER BY id",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(cursor(checkpoints, "PartnerDeleteV1"))
+        .bind(cursor(checkpoints, "PartnerDeleteV1"))
+        .bind(now_id)
+        .fetch_all(self.pool())
+        .await?;
+        for row in deletes {
+            body.push_str(&sync_line(
+                "PartnerDeleteV1",
+                json!({
+                    "sharedById": row.shared_by_id,
+                    "sharedWithId": row.shared_with_id,
+                }),
+                &row.id,
+            ));
+        }
+        let rows: Vec<SyncPartner> = sqlx::query_as(
+            "SELECT updateId AS update_id, sharedById AS shared_by_id,
+                    sharedWithId AS shared_with_id, inTimeline AS in_timeline
+             FROM partner
+             WHERE (sharedById = ? OR sharedWithId = ?)
+               AND (? IS NULL OR updateId > ?) AND updateId < ?
+             ORDER BY updateId",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(cursor(checkpoints, "PartnerV1"))
+        .bind(cursor(checkpoints, "PartnerV1"))
+        .bind(now_id)
+        .fetch_all(self.pool())
+        .await?;
+        for row in rows {
+            body.push_str(&sync_line(
+                "PartnerV1",
+                json!({
+                    "sharedById": row.shared_by_id,
+                    "sharedWithId": row.shared_with_id,
+                    "inTimeline": row.in_timeline != 0,
+                }),
+                &row.update_id,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Partner asset and partner EXIF sync. `createId` is the backfill cursor.
+    /// A partner asset's `isFavorite` is always false.
+    async fn write_partner_library(
+        &self,
+        body: &mut String,
+        session_id: &str,
+        user_id: &str,
+        checkpoints: &HashMap<String, String>,
+        now_id: &str,
+        exif: bool,
+    ) -> Result<(), DbError> {
+        let (delete_type, backfill_type, upsert_type) = if exif {
+            (None, "PartnerAssetExifBackfillV1", "PartnerAssetExifV1")
+        } else {
+            (
+                Some("PartnerAssetDeleteV1"),
+                "PartnerAssetBackfillV2",
+                "PartnerAssetV2",
+            )
+        };
+        if let Some(delete_type) = delete_type {
+            let deletes: Vec<(String, String)> = sqlx::query_as(
+                "SELECT updateId, assetId FROM asset_audit
+                 WHERE ownerId IN (SELECT sharedById FROM partner WHERE sharedWithId = ?)
+                   AND (? IS NULL OR updateId > ?) AND updateId < ?
+                 ORDER BY updateId",
+            )
+            .bind(user_id)
+            .bind(cursor(checkpoints, delete_type))
+            .bind(cursor(checkpoints, delete_type))
+            .bind(now_id)
+            .fetch_all(self.pool())
+            .await?;
+            for (update_id, asset_id) in deletes {
+                body.push_str(&sync_line(
+                    delete_type,
+                    json!({ "assetId": asset_id }),
+                    &update_id,
+                ));
+            }
+        }
+        let backfill_ack = ack_parts(checkpoints, backfill_type);
+        let partners: Vec<SyncPartnerCreated> = sqlx::query_as(
+            "SELECT sharedById AS shared_by_id, createId AS create_id
+             FROM partner
+             WHERE sharedWithId = ? AND createId < ?
+               AND (? IS NULL OR createId >= ?)
+             ORDER BY createId",
+        )
+        .bind(user_id)
+        .bind(now_id)
+        .bind(backfill_ack.map(|ack| ack.update_id))
+        .bind(backfill_ack.map(|ack| ack.update_id))
+        .fetch_all(self.pool())
+        .await?;
+        if let Some(end_id) = cursor(checkpoints, upsert_type) {
+            for partner in &partners {
+                if backfill_is_complete(backfill_ack, &partner.create_id) {
+                    continue;
+                }
+                let start = backfill_start(backfill_ack, &partner.create_id);
+                let assets = self
+                    .assets_owned_between(&partner.shared_by_id, start, end_id, now_id)
+                    .await?;
+                for asset in assets {
+                    let update_id = asset.update_id.clone();
+                    body.push_str(&sync_acked(
+                        backfill_type,
+                        partner_sync_json(&asset, exif),
+                        &format!("{backfill_type}|{}|{update_id}", partner.create_id),
+                    ));
+                }
+                body.push_str(&sync_acked(
+                    "SyncAckV1",
+                    json!({}),
+                    &format!("{backfill_type}|{}|complete", partner.create_id),
+                ));
+            }
+        } else if let Some(last) = partners.last() {
+            self.save_checkpoint(
+                session_id,
+                backfill_type,
+                &format!("{backfill_type}|{}|complete", last.create_id),
+            )
+            .await?;
+        }
+        let assets = self
+            .partner_assets_since(user_id, cursor(checkpoints, upsert_type), now_id)
+            .await?;
+        for asset in assets {
+            let update_id = asset.update_id.clone();
+            body.push_str(&sync_line(
+                upsert_type,
+                partner_sync_json(&asset, exif),
+                &update_id,
+            ));
+        }
+        Ok(())
+    }
+
+    async fn save_checkpoint(
+        &self,
+        session_id: &str,
+        kind: &str,
+        ack: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO sync_checkpoint (sessionId, type, ack) VALUES (?, ?, ?)
+             ON CONFLICT(sessionId, type) DO UPDATE SET ack = excluded.ack",
+        )
+        .bind(session_id)
+        .bind(kind)
+        .bind(ack)
+        .execute(self.pool())
+        .await?;
         Ok(())
     }
 
@@ -846,6 +1050,27 @@ impl App {
 }
 
 #[derive(sqlx::FromRow)]
+struct SyncPartner {
+    update_id: String,
+    shared_by_id: String,
+    shared_with_id: String,
+    in_timeline: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct SyncPartnerDelete {
+    id: String,
+    shared_by_id: String,
+    shared_with_id: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct SyncPartnerCreated {
+    shared_by_id: String,
+    create_id: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct SyncMemory {
     update_id: String,
     id: String,
@@ -967,10 +1192,54 @@ fn sync_birth(value: Option<String>) -> Value {
 }
 
 fn sync_line(kind: &str, data: Value, update_id: &str) -> String {
-    format!(
-        "{}\n",
-        json!({ "type": kind, "data": data, "ack": format!("{kind}|{update_id}") })
-    )
+    sync_acked(kind, data, &format!("{kind}|{update_id}"))
+}
+
+fn sync_acked(kind: &str, data: Value, ack: &str) -> String {
+    format!("{}\n", json!({ "type": kind, "data": data, "ack": ack }))
+}
+
+#[derive(Clone, Copy)]
+struct AckParts<'a> {
+    update_id: &'a str,
+    extra_id: Option<&'a str>,
+}
+
+fn ack_parts<'a>(checkpoints: &'a HashMap<String, String>, kind: &str) -> Option<AckParts<'a>> {
+    let mut parts = checkpoints.get(kind)?.split('|');
+    if parts.next()? != kind {
+        return None;
+    }
+    let update_id = parts.next()?;
+    if update_id.is_empty() {
+        return None;
+    }
+    let extra_id = parts.next().filter(|extra| !extra.is_empty());
+    Some(AckParts {
+        update_id,
+        extra_id,
+    })
+}
+
+fn backfill_is_complete(ack: Option<AckParts<'_>>, create_id: &str) -> bool {
+    ack.is_some_and(|ack| ack.update_id == create_id && ack.extra_id == Some("complete"))
+}
+
+fn backfill_start<'a>(ack: Option<AckParts<'a>>, create_id: &str) -> Option<&'a str> {
+    let ack = ack?;
+    if ack.update_id != create_id {
+        return None;
+    }
+    ack.extra_id.filter(|extra| *extra != "complete")
+}
+
+fn partner_sync_json(asset: &AssetRecord, exif: bool) -> Value {
+    if exif {
+        return sync_exif_json(asset);
+    }
+    let mut data = sync_asset_json(asset);
+    data["isFavorite"] = json!(false);
+    data
 }
 
 fn cursor<'a>(checkpoints: &'a HashMap<String, String>, kind: &str) -> Option<&'a str> {

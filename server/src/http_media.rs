@@ -446,6 +446,12 @@ async fn sync_stream(State(app): State<App>, request: Request) -> Response {
             "SyncRequestType.AssetFacesV1 is deprecated, use SyncRequestType.AssetFacesV2 instead",
         );
     }
+    if types.iter().any(|kind| kind == "PartnerAssetsV1") {
+        return message(
+            StatusCode::BAD_REQUEST,
+            "SyncRequestType.PartnerAssetsV1 is deprecated, use SyncRequestType.PartnerAssetsV2 instead",
+        );
+    }
     match app
         .sync_stream(&session.session_id, &session.user.id, &types, reset)
         .await

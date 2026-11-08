@@ -532,20 +532,21 @@ impl App {
 
     pub(crate) async fn timeline_buckets(
         &self,
-        user_id: &str,
-        grant: Option<&ShareGrant>,
-        album_id: Option<&str>,
-        order: &str,
+        request: &TimelineRequest<'_>,
     ) -> Result<Value, ApiError> {
-        self.require_timeline_album(user_id, grant, album_id)
+        self.require_timeline_album(request.user_id, request.grant, request.album_id)
             .await?;
-        let desc = order != "asc";
-        let sql = bucket_month_sql(album_id.is_some(), desc);
+        let partners = timeline_partners(request);
+        let desc = request.order != "asc";
+        let sql = bucket_month_sql(request.album_id.is_some(), partners, desc);
         let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
-        query = match album_id {
+        query = match request.album_id {
             Some(album_id) => query.bind(album_id),
-            None => query.bind(user_id),
+            None => query.bind(request.user_id),
         };
+        if partners {
+            query = query.bind(request.user_id);
+        }
         let rows = query.fetch_all(self.pool()).await?;
         let buckets = rows
             .into_iter()
@@ -556,25 +557,26 @@ impl App {
 
     pub(crate) async fn timeline_bucket(
         &self,
-        user_id: &str,
-        grant: Option<&ShareGrant>,
-        album_id: Option<&str>,
-        order: &str,
+        request: &TimelineRequest<'_>,
         time_bucket: &str,
         with_coordinates: bool,
     ) -> Result<Value, ApiError> {
-        self.require_timeline_album(user_id, grant, album_id)
+        self.require_timeline_album(request.user_id, request.grant, request.album_id)
             .await?;
-        let show_place = grant.is_none_or(|grant| grant.show_metadata);
+        let show_place = request.grant.is_none_or(|grant| grant.show_metadata);
         let coordinates = with_coordinates && show_place;
+        let partners = timeline_partners(request);
         let month = month_key(time_bucket);
-        let desc = order != "asc";
-        let sql = bucket_asset_sql(album_id.is_some(), desc);
+        let desc = request.order != "asc";
+        let sql = bucket_asset_sql(request.album_id.is_some(), partners, desc);
         let mut query = sqlx::query_as::<_, BucketAsset>(&sql).bind(month);
-        query = match album_id {
+        query = match request.album_id {
             Some(album_id) => query.bind(album_id),
-            None => query.bind(user_id),
+            None => query.bind(request.user_id),
         };
+        if partners {
+            query = query.bind(request.user_id);
+        }
         let rows = query.fetch_all(self.pool()).await?;
         Ok(bucket_json(&rows, show_place, coordinates))
     }
@@ -1144,13 +1146,15 @@ fn push_archive(
     ));
 }
 
-fn bucket_month_sql(album: bool, desc: bool) -> String {
+fn bucket_month_sql(album: bool, partners: bool, desc: bool) -> String {
     let direction = if desc { "DESC" } else { "ASC" };
     let (from, filter) = if album {
         (
             "FROM asset JOIN album_asset ON album_asset.assetId = asset.id",
             "album_asset.albumId = ?",
         )
+    } else if partners {
+        ("FROM asset", PARTNER_TIMELINE)
     } else {
         ("FROM asset", "asset.ownerId = ?")
     };
@@ -1163,13 +1167,15 @@ fn bucket_month_sql(album: bool, desc: bool) -> String {
     )
 }
 
-fn bucket_asset_sql(album: bool, desc: bool) -> String {
+fn bucket_asset_sql(album: bool, partners: bool, desc: bool) -> String {
     let direction = if desc { "DESC" } else { "ASC" };
     let (from, filter) = if album {
         (
             "FROM asset JOIN album_asset ON album_asset.assetId = asset.id",
             "album_asset.albumId = ?",
         )
+    } else if partners {
+        ("FROM asset", PARTNER_TIMELINE)
     } else {
         ("FROM asset", "asset.ownerId = ?")
     };
@@ -1286,6 +1292,24 @@ fn offset_hours_between(local: &str, file_created: &str) -> f64 {
         return 0.0;
     };
     (local.timestamp() - file_created.timestamp()) as f64 / 3600.0
+}
+
+/// Main timeline only. Album buckets stay on the album, and a partner is included
+/// only when that recipient has turned `inTimeline` on.
+const PARTNER_TIMELINE: &str = "(asset.ownerId = ? OR asset.ownerId IN (
+    SELECT sharedById FROM partner WHERE sharedWithId = ? AND inTimeline = 1
+))";
+
+pub(crate) struct TimelineRequest<'a> {
+    pub user_id: &'a str,
+    pub grant: Option<&'a ShareGrant>,
+    pub album_id: Option<&'a str>,
+    pub order: &'a str,
+    pub with_partners: bool,
+}
+
+fn timeline_partners(request: &TimelineRequest<'_>) -> bool {
+    request.with_partners && request.album_id.is_none() && request.grant.is_none()
 }
 
 fn month_key(time_bucket: &str) -> String {

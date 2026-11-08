@@ -24,6 +24,8 @@ pub(crate) struct ShareQuery {
     pub time_bucket: Option<String>,
     #[serde(rename = "withCoordinates")]
     pub with_coordinates: Option<String>,
+    #[serde(rename = "withPartners")]
+    pub with_partners: Option<String>,
     pub size: Option<String>,
 }
 
@@ -317,15 +319,18 @@ async fn timeline_buckets(
         Ok(auth) => auth,
         Err(response) => return response,
     };
-    match app
-        .timeline_buckets(
-            user_id(&auth),
-            grant(&auth),
-            query.album_id.as_deref(),
-            query.order.as_deref().unwrap_or("desc"),
-        )
-        .await
-    {
+    let with_partners = match flag_text(query.with_partners.as_deref()) {
+        Ok(value) => value,
+        Err(text) => return message(StatusCode::BAD_REQUEST, text),
+    };
+    let request = crate::shares::TimelineRequest {
+        user_id: user_id(&auth),
+        grant: grant(&auth),
+        album_id: query.album_id.as_deref(),
+        order: query.order.as_deref().unwrap_or("desc"),
+        with_partners,
+    };
+    match app.timeline_buckets(&request).await {
         Ok(body) => json_ok(body),
         Err(error) => from_api(error),
     }
@@ -344,15 +349,19 @@ async fn timeline_bucket(
         Err(response) => return response,
     };
     let coordinates = matches!(query.with_coordinates.as_deref(), Some("true" | "1"));
+    let with_partners = match flag_text(query.with_partners.as_deref()) {
+        Ok(value) => value,
+        Err(text) => return message(StatusCode::BAD_REQUEST, text),
+    };
+    let request = crate::shares::TimelineRequest {
+        user_id: user_id(&auth),
+        grant: grant(&auth),
+        album_id: query.album_id.as_deref(),
+        order: query.order.as_deref().unwrap_or("desc"),
+        with_partners,
+    };
     match app
-        .timeline_bucket(
-            user_id(&auth),
-            grant(&auth),
-            query.album_id.as_deref(),
-            query.order.as_deref().unwrap_or("desc"),
-            &time_bucket,
-            coordinates,
-        )
+        .timeline_bucket(&request, &time_bucket, coordinates)
         .await
     {
         Ok(body) => json_ok(body),
@@ -530,6 +539,14 @@ fn query_from_uri(query: Option<&str>) -> ShareQuery {
         }
     }
     parsed
+}
+
+fn flag_text(value: Option<&str>) -> Result<bool, &'static str> {
+    match value {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err("Validation failed"),
+    }
 }
 
 fn string_ids(value: Option<&Value>) -> Vec<String> {

@@ -318,6 +318,55 @@ impl App {
         Ok(rows)
     }
 
+    /// Assets one partner already had at `until_inclusive`, excluding anything at or after `before`.
+    pub(crate) async fn assets_owned_between(
+        &self,
+        owner_id: &str,
+        after: Option<&str>,
+        until_inclusive: &str,
+        before: &str,
+    ) -> Result<Vec<AssetRecord>, DbError> {
+        let sql = format!(
+            "{ASSET_SQL} WHERE asset.ownerId = ?
+             AND asset.updateId <= ? AND asset.updateId < ?
+             AND (? IS NULL OR asset.updateId > ?)
+             ORDER BY asset.updateId"
+        );
+        let rows = sqlx::query_as::<_, AssetRecord>(&sql)
+            .bind(owner_id)
+            .bind(until_inclusive)
+            .bind(before)
+            .bind(after)
+            .bind(after)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(rows)
+    }
+
+    /// Assets shared with `recipient_id`, newer than the partner-asset ack.
+    pub(crate) async fn partner_assets_since(
+        &self,
+        recipient_id: &str,
+        after: Option<&str>,
+        before: &str,
+    ) -> Result<Vec<AssetRecord>, DbError> {
+        let sql = format!(
+            "{ASSET_SQL} WHERE asset.ownerId IN (
+                SELECT sharedById FROM partner WHERE sharedWithId = ?
+             )
+             AND (? IS NULL OR asset.updateId > ?) AND asset.updateId < ?
+             ORDER BY asset.updateId"
+        );
+        let rows = sqlx::query_as::<_, AssetRecord>(&sql)
+            .bind(recipient_id)
+            .bind(after)
+            .bind(after)
+            .bind(before)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(rows)
+    }
+
     pub(crate) async fn asset_value(&self, record: &AssetRecord) -> Result<Value, DbError> {
         let stack = if let Some(stack_id) = &record.stack_id {
             self.stack_summary(stack_id).await?

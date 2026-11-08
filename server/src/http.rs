@@ -38,6 +38,7 @@ pub fn router(app: App) -> Router {
         .merge(crate::http_activity::routes())
         .merge(crate::http_browse::routes())
         .merge(crate::http_people::routes())
+        .merge(crate::http_partners::routes())
         .merge(crate::http_media::routes())
         .merge(crate::http_shares::routes())
         .fallback(crate::web::browser_document)
