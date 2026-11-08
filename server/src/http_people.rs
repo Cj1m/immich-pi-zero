@@ -1,7 +1,7 @@
 //! People list, person search, hide and favorite, and people-user shares.
 
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -20,6 +20,7 @@ pub(crate) fn routes() -> Router<App> {
             get(list_users).put(upsert_users).delete(remove_users),
         )
         .route("/api/people/{id}/statistics", get(statistics))
+        .route("/api/people/{id}/thumbnail", get(thumbnail))
         .route(
             "/api/people/{id}",
             get(person).put(update_person).patch(update_person),
@@ -107,6 +108,33 @@ async fn statistics(State(app): State<App>, Path(id): Path<String>, request: Req
     };
     match app.person_statistics(&user_id, &id).await {
         Ok(body) => json_ok(body),
+        Err(error) => people_error(error),
+    }
+}
+
+async fn thumbnail(State(app): State<App>, Path(id): Path<String>, request: Request) -> Response {
+    let headers = request.headers().clone();
+    let raw_query = request.uri().query().unwrap_or("").to_string();
+    if uuid::Uuid::parse_str(&id).is_err() {
+        return message(StatusCode::BAD_REQUEST, "Validation failed");
+    }
+    let user_id = match viewer(&app, &headers, &share_from_query(&raw_query)).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    match app.person_thumbnail(&user_id, &id).await {
+        Ok((content_type, bytes)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, content_type),
+                (
+                    header::CACHE_CONTROL,
+                    "private, no-cache, no-transform".to_string(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
         Err(error) => people_error(error),
     }
 }

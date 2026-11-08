@@ -316,6 +316,41 @@ async fn people_list_search_and_shares() {
 
     let (status, body) = call(
         &app,
+        json_request(
+            "GET",
+            &format!("/api/people/{ada}/thumbnail"),
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    let missing_thumb: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 404, "{missing_thumb}");
+    assert_eq!(missing_thumb["message"], "Not found");
+    let thumb_path = dir.join("ada.jpg");
+    std::fs::write(&thumb_path, jpeg(128)).unwrap();
+    sqlx::query("UPDATE person SET thumbnailPath = ? WHERE ownerId = ? AND personGroupId = ?")
+        .bind(thumb_path.to_str().unwrap())
+        .bind(&user_id)
+        .bind(&ada)
+        .execute(app.pool())
+        .await
+        .unwrap();
+    let (status, thumb) = call(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/people/{ada}/thumbnail?c=1"),
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&thumb));
+    assert_eq!(&thumb[..2], &[0xFF, 0xD8]);
+
+    let (status, body) = call(
+        &app,
         json_request("GET", "/api/search/person?name=ada", Some(&cookie), None),
     )
     .await;

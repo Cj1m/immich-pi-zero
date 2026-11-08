@@ -154,6 +154,51 @@ impl App {
         Ok(json!({ "assets": assets }))
     }
 
+    pub(crate) async fn person_thumbnail(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<(String, Vec<u8>), PeopleError> {
+        let own: Option<String> = sqlx::query_scalar(
+            "SELECT thumbnailPath FROM person WHERE ownerId = ? AND personGroupId = ?",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        let shared: Option<String> = sqlx::query_scalar(
+            "SELECT person.thumbnailPath
+             FROM person
+             JOIN person_user ON person_user.personGroupId = person.personGroupId
+               AND person_user.sharedById = person.ownerId
+               AND person_user.sharedWithId = ?
+             WHERE person.personGroupId = ? AND person.thumbnailPath != ''
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        let path = match own {
+            Some(path) if !path.is_empty() => Some(path),
+            Some(_) => shared.clone(),
+            None if shared.is_some() => shared,
+            None => {
+                return Err(PeopleError::Status(
+                    StatusCode::BAD_REQUEST,
+                    "Not found or no person.read access",
+                ));
+            }
+        };
+        let Some(path) = path.filter(|path| !path.is_empty()) else {
+            return Err(PeopleError::Status(StatusCode::NOT_FOUND, "Not found"));
+        };
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|_| PeopleError::Status(StatusCode::NOT_FOUND, "Not found"))?;
+        Ok((thumbnail_type(&path).to_string(), bytes))
+    }
+
     pub(crate) async fn search_people(
         &self,
         user_id: &str,
@@ -670,6 +715,19 @@ fn user_brief(
         "avatarColor": avatar_color.unwrap_or_else(|| avatar_color_for_email(email)),
         "profileChangedAt": profile_changed_at,
     })
+}
+
+fn thumbnail_type(path: &str) -> &'static str {
+    let extension = path.rsplit('.').next().unwrap_or("");
+    if extension.eq_ignore_ascii_case("png") {
+        "image/png"
+    } else if extension.eq_ignore_ascii_case("webp") {
+        "image/webp"
+    } else if extension.eq_ignore_ascii_case("gif") {
+        "image/gif"
+    } else {
+        "image/jpeg"
+    }
 }
 
 fn optional_bool(body: &Value, key: &str) -> Result<Option<i64>, PeopleError> {
