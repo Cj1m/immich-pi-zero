@@ -1,10 +1,12 @@
 //! Pi Immich server. Responses match Immich v3.3.6 where the official mobile app or web UI can see them.
 
+mod activity;
 mod albums;
 mod config;
 mod db;
 mod exif_meta;
 mod http;
+mod http_activity;
 mod http_config;
 mod http_media;
 mod http_memories;

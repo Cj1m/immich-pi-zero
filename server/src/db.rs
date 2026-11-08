@@ -559,6 +559,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 6 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V6.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (6)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -838,6 +856,21 @@ CREATE TABLE memory_asset_audit (
     updateId TEXT NOT NULL
 );
 CREATE INDEX memory_asset_audit_owner ON memory_asset_audit(ownerId, updateId);
+";
+
+const SCHEMA_V6: &str = "
+CREATE TABLE activity (
+    id TEXT PRIMARY KEY NOT NULL,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    albumId TEXT NOT NULL REFERENCES album(id) ON DELETE CASCADE,
+    userId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    assetId TEXT REFERENCES asset(id) ON DELETE CASCADE,
+    comment TEXT,
+    isLiked INTEGER NOT NULL,
+    updateId TEXT NOT NULL
+);
+CREATE INDEX activity_album ON activity(albumId, createdAt);
 ";
 
 async fn user_count(pool: &SqlitePool) -> Result<i64, StartupError> {

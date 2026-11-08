@@ -237,6 +237,11 @@ impl App {
                 results.push(json!({ "id": asset_id, "success": false, "error": "not_found" }));
                 continue;
             }
+            sqlx::query("DELETE FROM activity WHERE albumId = ? AND assetId = ?")
+                .bind(album_id)
+                .bind(asset_id)
+                .execute(self.pool())
+                .await?;
             sqlx::query(
                 "INSERT INTO album_asset_audit (id, albumId, assetId, ownerId, updateId) VALUES (?, ?, ?, ?, ?)",
             )
