@@ -7,18 +7,30 @@ const THUMB_EDGE: u32 = 250;
 const PREVIEW_EDGE: u32 = 1440;
 
 pub struct ThumbFiles {
+    /// Pixel size after the EXIF orientation is applied. This is the asset width and height.
     pub width: i64,
     pub height: i64,
+    /// Pixel size of the file before orientation. The Original is not rotated.
+    pub raw_width: i64,
+    pub raw_height: i64,
 }
 
 /// Decode a still and write a thumbnail and a preview. `None` means the bytes are not a still we can read.
-pub fn write_image_thumbs(data_dir: &Path, asset_id: &str, source: &Path) -> Option<ThumbFiles> {
+pub fn write_image_thumbs(
+    data_dir: &Path,
+    asset_id: &str,
+    source: &Path,
+    orientation: Option<u16>,
+) -> Option<ThumbFiles> {
     let image = image::ImageReader::open(source)
         .ok()?
         .with_guessed_format()
         .ok()?
         .decode()
         .ok()?;
+    let raw_width = i64::from(image.width());
+    let raw_height = i64::from(image.height());
+    let image = apply_orientation(image, orientation);
     let width = i64::from(image.width());
     let height = i64::from(image.height());
     let directory = data_dir.join("thumbs").join(asset_id);
@@ -32,7 +44,26 @@ pub fn write_image_thumbs(data_dir: &Path, asset_id: &str, source: &Path) -> Opt
         image.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE)
     };
     write_jpeg(&preview_image, &preview)?;
-    Some(ThumbFiles { width, height })
+    Some(ThumbFiles {
+        width,
+        height,
+        raw_width,
+        raw_height,
+    })
+}
+
+/// Same order as Immich's sharp map: rotate, then a vertical flip, then a horizontal flip.
+fn apply_orientation(image: image::DynamicImage, orientation: Option<u16>) -> image::DynamicImage {
+    match orientation {
+        Some(2) => image.fliph(),
+        Some(3) => image.rotate180(),
+        Some(4) => image.rotate180().fliph(),
+        Some(5) => image.rotate270().flipv(),
+        Some(6) => image.rotate90(),
+        Some(7) => image.rotate90().flipv(),
+        Some(8) => image.rotate270(),
+        _ => image,
+    }
 }
 
 fn write_jpeg(image: &image::DynamicImage, path: &Path) -> Option<()> {
@@ -71,9 +102,13 @@ pub fn write_video_frame(data_dir: &Path, asset_id: &str, source: &Path) -> Opti
         .ok()?;
     let thumbnail = directory.join("thumbnail.jpg");
     write_jpeg(&image.thumbnail(THUMB_EDGE, THUMB_EDGE), &thumbnail)?;
+    let width = i64::from(image.width());
+    let height = i64::from(image.height());
     Some(ThumbFiles {
-        width: i64::from(image.width()),
-        height: i64::from(image.height()),
+        width,
+        height,
+        raw_width: width,
+        raw_height: height,
     })
 }
 

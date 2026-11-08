@@ -78,7 +78,11 @@ async fn call(app: &App, request: Request<Body>) -> (http::StatusCode, Vec<u8>, 
 }
 
 fn jpeg(red: u8) -> Vec<u8> {
-    let image = RgbImage::from_pixel(16, 10, Rgb([red, 40, 90]));
+    jpeg_size(16, 10, red)
+}
+
+fn jpeg_size(width: u32, height: u32, red: u8) -> Vec<u8> {
+    let image = RgbImage::from_pixel(width, height, Rgb([red, 40, 90]));
     let mut bytes = Vec::new();
     image::DynamicImage::ImageRgb8(image)
         .write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Jpeg)
@@ -159,6 +163,11 @@ async fn upload_syncs_and_albums_keep_the_asset_after_delete() {
     assert_eq!(asset["checksum"].as_str().unwrap().len(), 28);
     assert_eq!(asset["width"], 16);
     assert_eq!(asset["height"], 10);
+    assert_eq!(asset["fileCreatedAt"], created);
+    assert_eq!(asset["localDateTime"], created);
+    assert!(asset["exifInfo"]["make"].is_null());
+    assert!(asset["exifInfo"]["dateTimeOriginal"].is_null());
+    assert!(asset["exifInfo"]["latitude"].is_null());
     assert!(asset["duration"].is_null());
     let expected = base64_sha1(&bytes);
     assert_eq!(asset["checksum"], expected);
@@ -390,6 +399,104 @@ async fn upload_syncs_and_albums_keep_the_asset_after_delete() {
     let stack: Value = serde_json::from_slice(&stack).unwrap();
     assert_eq!(status, 201, "{stack}");
     assert!(stack["id"].is_string());
+
+    let exif_bytes = immich_server::embed_exif(
+        &jpeg_size(32, 8, 30),
+        &immich_server::ExifFixture {
+            make: Some("Canon".to_string()),
+            model: Some("EOS R6".to_string()),
+            lens_model: Some("RF 50mm".to_string()),
+            description: Some("A cat".to_string()),
+            orientation: Some(6),
+            rating: Some(4),
+            date_time_original: Some("2020:05:04 03:02:01".to_string()),
+            offset_time_original: Some("+02:00".to_string()),
+            iso: Some(200),
+            exposure: Some((1, 125)),
+            f_number: Some((28, 10)),
+            focal_length: Some((50, 1)),
+            latitude: Some(37.5),
+            longitude: Some(-122.5),
+            ..immich_server::ExifFixture::default()
+        },
+    );
+    let (status, body, _) = call(
+        &app,
+        upload_request(&cookie, "exif.jpg", &exif_bytes, created),
+    )
+    .await;
+    let uploaded: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 201, "{uploaded}");
+    let exif_id = uploaded["id"].as_str().unwrap();
+    let (status, body, _) = call(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/assets/{exif_id}"))
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let detailed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 200, "{detailed}");
+    assert_eq!(detailed["width"], 8);
+    assert_eq!(detailed["height"], 32);
+    assert_eq!(detailed["fileCreatedAt"], "2020-05-04T01:02:01.000Z");
+    assert_eq!(detailed["localDateTime"], "2020-05-04T03:02:01.000Z");
+    assert_eq!(detailed["fileModifiedAt"], created);
+    let info = &detailed["exifInfo"];
+    assert_eq!(info["make"], "Canon");
+    assert_eq!(info["model"], "EOS R6");
+    assert_eq!(info["lensModel"], "RF 50mm");
+    assert_eq!(info["description"], "A cat");
+    assert_eq!(info["orientation"], "6");
+    assert_eq!(info["rating"], 4);
+    assert_eq!(info["dateTimeOriginal"], "2020-05-04T01:02:01.000Z");
+    assert_eq!(info["timeZone"], "+02:00");
+    assert_eq!(info["iso"], 200);
+    assert_eq!(info["exposureTime"], "1/125");
+    assert_eq!(info["focalLength"], 50.0);
+    let aperture = info["fNumber"].as_f64().unwrap();
+    assert!((aperture - 2.8).abs() < 0.001, "{aperture}");
+    assert_eq!(info["latitude"], 37.5);
+    assert_eq!(info["longitude"], -122.5);
+    assert!(info["city"].is_null());
+    assert!(info["state"].is_null());
+    assert!(info["country"].is_null());
+    assert_eq!(info["exifImageWidth"], 32);
+    assert_eq!(info["exifImageHeight"], 8);
+
+    let (status, original, _) = call(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/assets/{exif_id}/original"))
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(original, exif_bytes);
+
+    let (status, thumb, _) = call(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/assets/{exif_id}/thumbnail?size=preview"))
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let preview = image::ImageReader::new(std::io::Cursor::new(thumb))
+        .with_guessed_format()
+        .unwrap()
+        .decode()
+        .unwrap();
+    assert!(preview.height() > preview.width());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

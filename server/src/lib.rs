@@ -3,6 +3,7 @@
 mod albums;
 mod config;
 mod db;
+mod exif_meta;
 mod http;
 mod http_config;
 mod http_media;
@@ -19,6 +20,8 @@ use std::net::SocketAddr;
 
 pub use config::{Config, StartupError};
 pub use db::App;
+#[doc(hidden)]
+pub use exif_meta::{embed_exif, ExifFixture};
 pub use http::router;
 
 /// Open the database, create the first admin when the server has no User, and serve HTTP.

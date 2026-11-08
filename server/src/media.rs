@@ -5,6 +5,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::db::{new_id, new_update_id, now_iso, App, DbError};
+use crate::exif_meta::{self, ExifMeta};
 use crate::thumbs::{self, ThumbFiles};
 
 const ASSET_SQL: &str = "SELECT
@@ -194,7 +195,8 @@ impl App {
         let asset_id = new_id();
         let key = format!("{owner_id}/{asset_id}/original");
         let (asset_type, mime) = classify_filename(&file.filename);
-        let thumbs = generate_thumbs(self.data_dir(), &asset_id, &file.temp_path, asset_type).await;
+        let (thumbs, exif) =
+            generate_thumbs(self.data_dir(), &asset_id, &file.temp_path, asset_type).await;
         let sidecar_key = file.sidecar_temp.as_ref().map(|_| format!("{key}.xmp"));
 
         if let Err(error) = self.store().put_file(&key, &file.temp_path, mime).await {
@@ -215,8 +217,7 @@ impl App {
 
         let now = now_iso();
         let update_id = new_update_id();
-        let width = thumbs.as_ref().map(|item| item.width);
-        let height = thumbs.as_ref().map(|item| item.height);
+        let (width, height, exif_width, exif_height) = image_dimensions(&thumbs, &exif);
         let insert = insert_asset(
             self,
             &asset_id,
@@ -230,6 +231,9 @@ impl App {
             &now,
             width,
             height,
+            exif_width,
+            exif_height,
+            &exif,
             sidecar_key.as_deref(),
             thumbs.as_ref(),
         )
@@ -565,7 +569,7 @@ impl App {
             if !source.is_file() {
                 return Err(DbError::NotFound);
             }
-            let thumbs =
+            let (thumbs, _) =
                 generate_thumbs(self.data_dir(), &record.id, &source, &record.asset_type).await;
             let Some(thumbs) = thumbs else {
                 return Err(DbError::NotFound);
@@ -804,9 +808,20 @@ async fn insert_asset(
     now: &str,
     width: Option<i64>,
     height: Option<i64>,
+    exif_width: Option<i64>,
+    exif_height: Option<i64>,
+    exif: &ExifMeta,
     sidecar_key: Option<&str>,
     thumbs: Option<&ThumbFiles>,
 ) -> Result<(), DbError> {
+    let created_at = exif
+        .date_time_original
+        .as_deref()
+        .unwrap_or(file.file_created_at.as_str());
+    let local_at = exif
+        .local_date_time
+        .as_deref()
+        .unwrap_or(file.file_created_at.as_str());
     let mut transaction = app.pool().begin().await?;
     sqlx::query(
         "INSERT INTO asset (
@@ -829,9 +844,9 @@ async fn insert_asset(
     .bind(key)
     .bind(filename)
     .bind(mime)
-    .bind(&file.file_created_at)
+    .bind(created_at)
     .bind(&file.file_modified_at)
-    .bind(&file.file_created_at)
+    .bind(local_at)
     .bind(i64::from(file.is_favorite))
     .bind(file.duration_ms)
     .bind(file.checksum.as_slice())
@@ -844,15 +859,39 @@ async fn insert_asset(
     .bind(now)
     .execute(&mut *transaction)
     .await?;
+    let modify_date = exif.parsed.then_some(file.file_modified_at.as_str());
     sqlx::query(
         "INSERT INTO asset_exif (
-            assetId, fileSizeInByte, exifImageWidth, exifImageHeight, description, updatedAt, updateId
-        ) VALUES (?, ?, ?, ?, '', ?, ?)",
+            assetId, fileSizeInByte, exifImageWidth, exifImageHeight, description,
+            make, model, orientation, dateTimeOriginal, modifyDate, timeZone,
+            lensModel, fNumber, focalLength, iso, exposureTime,
+            latitude, longitude, rating, updatedAt, updateId
+        ) VALUES (
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?
+        )",
     )
     .bind(asset_id)
     .bind(file.byte_size)
-    .bind(width)
-    .bind(height)
+    .bind(exif_width)
+    .bind(exif_height)
+    .bind(&exif.description)
+    .bind(&exif.make)
+    .bind(&exif.model)
+    .bind(exif.orientation.map(|value| value.to_string()))
+    .bind(&exif.date_time_original)
+    .bind(modify_date)
+    .bind(&exif.time_zone)
+    .bind(&exif.lens_model)
+    .bind(exif.f_number)
+    .bind(exif.focal_length)
+    .bind(exif.iso)
+    .bind(&exif.exposure_time)
+    .bind(exif.latitude)
+    .bind(exif.longitude)
+    .bind(exif.rating)
     .bind(now)
     .bind(update_id)
     .execute(&mut *transaction)
@@ -894,28 +933,49 @@ async fn insert_asset(
     Ok(())
 }
 
+fn image_dimensions(
+    thumbs: &Option<ThumbFiles>,
+    exif: &ExifMeta,
+) -> (Option<i64>, Option<i64>, Option<i64>, Option<i64>) {
+    let (raw_width, raw_height) = match thumbs {
+        Some(thumbs) => (Some(thumbs.raw_width), Some(thumbs.raw_height)),
+        None => (exif.pixel_width, exif.pixel_height),
+    };
+    let (width, height) = match thumbs {
+        Some(thumbs) => (Some(thumbs.width), Some(thumbs.height)),
+        None if exif_meta::is_sidewards(exif.orientation) => (raw_height, raw_width),
+        None => (raw_width, raw_height),
+    };
+    (width, height, raw_width, raw_height)
+}
+
 async fn generate_thumbs(
     data_dir: &std::path::Path,
     asset_id: &str,
     source: &std::path::Path,
     asset_type: &str,
-) -> Option<ThumbFiles> {
+) -> (Option<ThumbFiles>, ExifMeta) {
     let data_dir = data_dir.to_path_buf();
     let asset_id = asset_id.to_string();
     let source = source.to_path_buf();
     let asset_type = asset_type.to_string();
-    tokio::task::spawn_blocking(move || {
+    let joined = tokio::task::spawn_blocking(move || {
         if asset_type == "IMAGE" {
-            thumbs::write_image_thumbs(&data_dir, &asset_id, &source)
+            let exif = exif_meta::read_path(&source);
+            let thumbs =
+                thumbs::write_image_thumbs(&data_dir, &asset_id, &source, exif.orientation);
+            (thumbs, exif)
         } else if asset_type == "VIDEO" {
-            thumbs::write_video_frame(&data_dir, &asset_id, &source)
+            (
+                thumbs::write_video_frame(&data_dir, &asset_id, &source),
+                ExifMeta::default(),
+            )
         } else {
-            None
+            (None, ExifMeta::default())
         }
     })
-    .await
-    .ok()
-    .flatten()
+    .await;
+    joined.unwrap_or_else(|_| (None, ExifMeta::default()))
 }
 
 pub(crate) fn sanitized_asset(record: &AssetRecord) -> Value {
