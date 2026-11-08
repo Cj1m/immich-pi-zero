@@ -5,10 +5,13 @@ mod config;
 mod db;
 mod http;
 mod http_media;
+mod http_shares;
 mod media;
+mod shares;
 mod store;
 mod sync;
 mod thumbs;
+mod web;
 
 use std::net::SocketAddr;
 

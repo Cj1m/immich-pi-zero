@@ -20,6 +20,7 @@ pub struct App {
     dummy_password_hash: String,
     store: std::sync::Arc<crate::store::Store>,
     data_dir: std::path::PathBuf,
+    web_root: std::path::PathBuf,
 }
 
 impl App {
@@ -33,6 +34,19 @@ impl App {
 
     pub(crate) fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
+    }
+
+    pub(crate) fn web_root(&self) -> &std::path::Path {
+        &self.web_root
+    }
+
+    pub(crate) async fn quota_size(&self, user_id: &str) -> Result<Option<i64>, DbError> {
+        let value: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT quotaSizeInBytes FROM user WHERE id = ?")
+                .bind(user_id)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(value.flatten())
     }
 
     pub async fn prepare(config: &Config) -> Result<Self, StartupError> {
@@ -63,6 +77,7 @@ impl App {
             dummy_password_hash,
             store: std::sync::Arc::new(store),
             data_dir: config.data_dir.clone(),
+            web_root: config.web_root.clone(),
         })
     }
 
@@ -459,6 +474,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 3 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V3.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (3)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -666,6 +699,30 @@ CREATE TABLE stack (
     createdAt TEXT NOT NULL,
     updatedAt TEXT NOT NULL,
     updateId TEXT NOT NULL
+);
+";
+
+const SCHEMA_V3: &str = "
+CREATE TABLE shared_link (
+    id TEXT PRIMARY KEY NOT NULL,
+    description TEXT,
+    userId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    key BLOB NOT NULL UNIQUE,
+    type TEXT NOT NULL,
+    createdAt TEXT NOT NULL,
+    expiresAt TEXT,
+    allowUpload INTEGER NOT NULL,
+    albumId TEXT REFERENCES album(id) ON DELETE CASCADE,
+    allowDownload INTEGER NOT NULL,
+    showExif INTEGER NOT NULL,
+    password TEXT,
+    slug TEXT
+);
+CREATE UNIQUE INDEX shared_link_slug_uq ON shared_link(slug) WHERE slug IS NOT NULL;
+CREATE TABLE shared_link_asset (
+    assetId TEXT NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+    sharedLinkId TEXT NOT NULL REFERENCES shared_link(id) ON DELETE CASCADE,
+    PRIMARY KEY (sharedLinkId, assetId)
 );
 ";
 

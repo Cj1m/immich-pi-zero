@@ -1,7 +1,6 @@
 //! Original upload, asset documents, trash, and stacks.
 //! `libraryId` stays null. A duplicate checksum, including one in the trash, returns the existing Asset.
 
-use axum::response::IntoResponse;
 use base64::Engine;
 use serde_json::{json, Value};
 
@@ -254,6 +253,22 @@ impl App {
     pub async fn asset_json(&self, owner_id: &str, id: &str) -> Result<Value, DbError> {
         let record = self.asset_record(owner_id, id).await?;
         self.asset_value(&record).await
+    }
+
+    /// Asset document for a shared link. `strip` is the `showMetadata` false body.
+    pub async fn share_asset_json(
+        &self,
+        owner_id: &str,
+        id: &str,
+        strip: bool,
+    ) -> Result<Value, DbError> {
+        let record = self.asset_record(owner_id, id).await?;
+        if strip {
+            return Ok(sanitized_asset(&record));
+        }
+        let mut value = self.asset_value(&record).await?;
+        value["people"] = json!([]);
+        Ok(value)
     }
 
     pub(crate) async fn asset_record(
@@ -529,6 +544,7 @@ impl App {
         owner_id: &str,
         id: &str,
         size: &str,
+        range_header: Option<&str>,
     ) -> Result<axum::response::Response, DbError> {
         let record = self.asset_record(owner_id, id).await?;
         let file_type = if size == "preview" {
@@ -565,15 +581,7 @@ impl App {
         let bytes = tokio::fs::read(&path)
             .await
             .map_err(|_| DbError::NotFound)?;
-        Ok((
-            axum::http::StatusCode::OK,
-            [(
-                axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("image/jpeg"),
-            )],
-            bytes,
-        )
-            .into_response())
+        Ok(jpeg_response(bytes, range_header))
     }
 
     async fn store_thumb_rows(&self, asset_id: &str, thumbs: &ThumbFiles) -> Result<(), DbError> {
@@ -908,6 +916,79 @@ async fn generate_thumbs(
     .await
     .ok()
     .flatten()
+}
+
+pub(crate) fn sanitized_asset(record: &AssetRecord) -> Value {
+    json!({
+        "id": record.id,
+        "type": record.asset_type,
+        "originalMimeType": record.original_mime_type,
+        "thumbhash": record.thumbhash.as_ref().map(|bytes| checksum_base64(bytes)),
+        "localDateTime": record.local_date_time,
+        "duration": record.duration,
+        "livePhotoVideoId": record.live_photo_video_id,
+        "hasMetadata": false,
+        "width": record.width,
+        "height": record.height,
+    })
+}
+
+fn jpeg_response(bytes: Vec<u8>, range_header: Option<&str>) -> axum::response::Response {
+    use axum::http::{header, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    const CACHE: &str = "private, max-age=86400, no-transform, stale-while-revalidate=2592000, stale-if-error=2592000";
+    let len = bytes.len() as u64;
+    if let Some(header_value) = range_header {
+        let Some((start, end)) = crate::store::parse_range(header_value, len) else {
+            let mut response = (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(
+                    header::CONTENT_RANGE,
+                    HeaderValue::from_str(&format!("bytes */{len}")).expect("range"),
+                )],
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static(CACHE));
+            return response;
+        };
+        let slice = bytes[start as usize..=end as usize].to_vec();
+        let slice_len = slice.len();
+        let mut response = (
+            StatusCode::PARTIAL_CONTENT,
+            [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
+            slice,
+        )
+            .into_response();
+        let headers = response.headers_mut();
+        headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&slice_len.to_string()).expect("length"),
+        );
+        headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(CACHE));
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{len}")).expect("range"),
+        );
+        return response;
+    }
+    let byte_len = bytes.len();
+    let mut response = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
+        bytes,
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&byte_len.to_string()).expect("length"),
+    );
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(CACHE));
+    response
 }
 
 fn asset_json(record: &AssetRecord, stack: Option<Value>) -> Value {

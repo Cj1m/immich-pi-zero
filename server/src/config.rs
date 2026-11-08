@@ -18,6 +18,7 @@ pub struct S3Config {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub data_dir: PathBuf,
+    pub web_root: PathBuf,
     pub host: IpAddr,
     pub port: u16,
     pub admin_email: Option<String>,
@@ -45,8 +46,14 @@ impl Config {
             })?,
             None => 2283,
         };
+        let web_root = env::var("IMMICH_WEB_ROOT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("web"));
         Ok(Self {
             data_dir,
+            web_root,
             host,
             port,
             admin_email: optional_env("IMMICH_ADMIN_EMAIL"),

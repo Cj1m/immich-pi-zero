@@ -19,6 +19,7 @@ fn config(dir: &Path) -> Config {
         admin_name: Some("Ada".to_string()),
         admin_password: Some("correct horse".to_string()),
         s3: None,
+        web_root: dir.join("web"),
     }
 }
 

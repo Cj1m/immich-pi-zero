@@ -8,13 +8,13 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use tokio::io::AsyncWriteExt;
 
 use crate::db::{App, DbError};
 use crate::http::{db_error, json_ok, message, require_session};
+use crate::http_shares::{grant, library_auth, user_id, LibraryAuth, ShareQuery};
 use crate::media::{IncomingOriginal, IngestResult};
 
 pub fn routes() -> Router<App> {
@@ -58,11 +58,22 @@ pub fn routes() -> Router<App> {
 async fn upload_asset(
     State(app): State<App>,
     headers: HeaderMap,
+    Query(query): Query<ShareQuery>,
     mut multipart: Multipart,
 ) -> Response {
-    let session = match require_session(&app, &headers).await {
-        Ok(session) => session,
+    let (owner_id, share) = match library_auth(&app, &headers, &query, true).await {
+        Ok(LibraryAuth::User(id)) => (id, None),
+        Ok(LibraryAuth::Share(viewer)) => {
+            if !viewer.share.allow_upload {
+                return message(StatusCode::UNAUTHORIZED, "Unauthorized");
+            }
+            (viewer.user_id, Some(viewer.share))
+        }
         Err(response) => return response,
+    };
+    let quota = match app.quota_size(&owner_id).await {
+        Ok(quota) => quota,
+        Err(error) => return db_error(error),
     };
     let tmp = app.data_dir().join("tmp");
     if let Err(error) = tokio::fs::create_dir_all(&tmp).await {
@@ -174,14 +185,17 @@ async fn upload_asset(
             .cloned(),
         sidecar_temp: sidecar,
     };
-    let result = app
-        .ingest_original(
-            &session.user.id,
-            session.user.quota_size_in_bytes,
-            &incoming,
-        )
-        .await;
+    let result = app.ingest_original(&owner_id, quota, &incoming).await;
     remove_temps(&temps);
+    let asset_id = match &result {
+        Ok(IngestResult::Created(id) | IngestResult::Duplicate(id)) => Some(id.clone()),
+        Err(_) => None,
+    };
+    if let (Some(grant), Some(asset_id)) = (share.as_ref(), asset_id) {
+        if let Err(error) = app.attach_shared_upload(grant, &asset_id).await {
+            return db_error(error);
+        }
+    }
     match result {
         Ok(IngestResult::Created(id)) => (
             StatusCode::CREATED,
@@ -257,12 +271,33 @@ async fn asset_jobs(State(app): State<App>, request: Request) -> Response {
     }
 }
 
-async fn get_asset(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> Response {
-    let session = match require_session(&app, &headers).await {
-        Ok(session) => session,
+async fn get_asset(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Query(query): Query<ShareQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let auth = match library_auth(&app, &headers, &query, true).await {
+        Ok(auth) => auth,
         Err(response) => return response,
     };
-    match app.asset_json(&session.user.id, &id).await {
+    if let Some(link) = grant(&auth) {
+        match app.share_can_see(user_id(&auth), link, &id, false).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return message(StatusCode::BAD_REQUEST, "Not found or no asset.read access")
+            }
+            Err(error) => return db_error(error),
+        }
+        return match app
+            .share_asset_json(user_id(&auth), &id, !link.show_metadata)
+            .await
+        {
+            Ok(body) => json_ok(body),
+            Err(error) => db_error(error),
+        };
+    }
+    match app.asset_json(user_id(&auth), &id).await {
         Ok(body) => json_ok(body),
         Err(error) => db_error(error),
     }
@@ -315,38 +350,75 @@ async fn delete_assets(State(app): State<App>, request: Request) -> Response {
 async fn download_original(
     State(app): State<App>,
     Path(id): Path<String>,
+    Query(query): Query<ShareQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let session = match require_session(&app, &headers).await {
-        Ok(session) => session,
+    let auth = match library_auth(&app, &headers, &query, true).await {
+        Ok(auth) => auth,
         Err(response) => return response,
     };
+    if let Some(link) = grant(&auth) {
+        match app.share_can_see(user_id(&auth), link, &id, true).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return message(
+                    StatusCode::BAD_REQUEST,
+                    "Not found or no asset.download access",
+                )
+            }
+            Err(error) => return db_error(error),
+        }
+    }
     let range = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok());
-    match app.original_response(&session.user.id, &id, range).await {
+    match app.original_response(user_id(&auth), &id, range).await {
         Ok(response) => response,
         Err(error) => db_error(error),
     }
 }
 
-#[derive(Deserialize)]
-struct ThumbQuery {
-    size: Option<String>,
-}
-
 async fn download_thumbnail(
     State(app): State<App>,
     Path(id): Path<String>,
-    Query(query): Query<ThumbQuery>,
+    Query(query): Query<ShareQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let session = match require_session(&app, &headers).await {
-        Ok(session) => session,
+    let auth = match library_auth(&app, &headers, &query, true).await {
+        Ok(auth) => auth,
         Err(response) => return response,
     };
-    let size = query.size.unwrap_or_else(|| "thumbnail".to_string());
-    match app.thumbnail_response(&session.user.id, &id, &size).await {
+    if query.size.as_deref() == Some("fullsize") {
+        let mut location = format!("/api/assets/{id}/thumbnail?size=preview");
+        if let Some(key) = query.key.as_deref().filter(|value| !value.is_empty()) {
+            location.push_str("&key=");
+            location.push_str(key);
+        } else if let Some(slug) = query.slug.as_deref().filter(|value| !value.is_empty()) {
+            location.push_str("&slug=");
+            location.push_str(slug);
+        }
+        return (StatusCode::FOUND, [(header::LOCATION, location)]).into_response();
+    }
+    if let Some(link) = grant(&auth) {
+        match app.share_can_see(user_id(&auth), link, &id, false).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return message(StatusCode::BAD_REQUEST, "Not found or no asset.view access")
+            }
+            Err(error) => return db_error(error),
+        }
+    }
+    let size = query
+        .size
+        .clone()
+        .unwrap_or_else(|| "thumbnail".to_string());
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    match app
+        .thumbnail_response(user_id(&auth), &id, &size, range)
+        .await
+    {
         Ok(response) => response,
         Err(error) => db_error(error),
     }

@@ -410,6 +410,10 @@ impl App {
             })
             .collect();
         let shared = album_users.len() > 1;
+        let linked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shared_link WHERE albumId = ?")
+            .bind(&row.id)
+            .fetch_one(self.pool())
+            .await?;
         Ok(json!({
             "id": row.id,
             "albumName": row.album_name,
@@ -419,7 +423,7 @@ impl App {
             "albumThumbnailAssetId": row.album_thumbnail_asset_id,
             "shared": shared,
             "albumUsers": album_users,
-            "hasSharedLink": false,
+            "hasSharedLink": linked > 0,
             "assetCount": row.asset_count,
             "isActivityEnabled": row.is_activity_enabled != 0,
             "order": row.album_order,

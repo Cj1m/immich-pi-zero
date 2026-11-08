@@ -18,6 +18,7 @@ fn config(dir: &Path, password: Option<&str>) -> Config {
         admin_name: Some("Ada".to_string()),
         admin_password: password.map(str::to_string),
         s3: None,
+        web_root: dir.join("web"),
     }
 }
 

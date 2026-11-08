@@ -90,6 +90,24 @@ impl Store {
         }
     }
 
+    /// Whole object. Missing keys are `None`. Used by the download zip, one file at a time.
+    pub async fn read_file(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let response = match self
+            .bytes_response(key, None, "application/octet-stream", "file")
+            .await?
+        {
+            Some(response) => response,
+            None => return Ok(None),
+        };
+        if response.status() != StatusCode::OK {
+            return Err(StoreError(format!("object status {}", response.status())));
+        }
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024 * 1024)
+            .await
+            .map_err(|error| StoreError(error.to_string()))?;
+        Ok(Some(bytes.to_vec()))
+    }
+
     /// Byte response for an Original. `range` is the raw Range header. Missing keys are `None`.
     pub async fn bytes_response(
         &self,
@@ -197,6 +215,12 @@ fn build_response(body: Body, slice: ObjectSlice, content_type: &str, filename: 
         HeaderValue::from_str(&slice.slice_len.to_string()).expect("content-length"),
     );
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(
+            "private, max-age=86400, no-transform, stale-while-revalidate=2592000, stale-if-error=2592000",
+        ),
+    );
     headers.insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_str(&content_disposition(filename))

@@ -25,8 +25,10 @@ pub fn router(app: App) -> Router {
         .route("/api/auth/logout", post(logout))
         .route("/api/users/me", get(current_user))
         .route("/api/users/me/preferences", get(preferences))
+        .route("/api/server/media-types", get(media_types))
         .merge(crate::http_media::routes())
-        .fallback(not_found)
+        .merge(crate::http_shares::routes())
+        .fallback(crate::web::browser_document)
         .layer(DefaultBodyLimit::disable())
         .with_state(app)
 }
@@ -162,10 +164,21 @@ async fn preferences(State(app): State<App>, request: Request) -> Response {
     json_ok(default_preferences())
 }
 
-async fn not_found(request: Request) -> Response {
-    let method = request.method();
-    let path = request.uri().path();
-    message(StatusCode::NOT_FOUND, format!("Cannot {method} {path}"))
+async fn media_types() -> Response {
+    json_ok(json!({
+        "image": [
+            ".avif", ".bmp", ".gif", ".jfif", ".jpeg", ".jpg", ".png", ".webp",
+            ".3fr", ".ari", ".arw", ".cap", ".cin", ".cr2", ".cr3", ".crw", ".dcr", ".dng",
+            ".erf", ".fff", ".iiq", ".k25", ".kdc", ".mrw", ".nef", ".nrw", ".orf", ".ori",
+            ".pef", ".psd", ".raf", ".raw", ".rw2", ".rwl", ".sr2", ".srf", ".srw", ".x3f",
+            ".heic", ".heif", ".hif", ".insp", ".jp2", ".jpe", ".jxl", ".mpo", ".svg", ".tif", ".tiff",
+        ],
+        "video": [
+            ".3gp", ".3gpp", ".avi", ".flv", ".insv", ".m2t", ".m2ts", ".m4v", ".mkv", ".mov",
+            ".mp4", ".mpe", ".mpeg", ".mpg", ".mts", ".mxf", ".ts", ".vob", ".webm", ".wmv",
+        ],
+        "sidecar": [".xmp"],
+    }))
 }
 
 #[derive(Deserialize)]
@@ -369,7 +382,7 @@ fn request_is_secure(request: &Request<Body>) -> bool {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"))
 }
 
-fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     let header = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in header.split(';') {
         let Some((key, value)) = part.trim().split_once('=') else {
