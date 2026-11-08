@@ -259,6 +259,8 @@ impl App {
                 .join("preview.jpg");
             if let Err(error) = crate::ml::encode_asset_clip(self, &asset_id, &preview).await {
                 eprintln!("clip encode: {error}");
+            } else if let Err(error) = self.detect_duplicates(&asset_id, false).await {
+                eprintln!("duplicate detection: {error:?}");
             }
         }
         Ok(IngestResult::Created(asset_id))
@@ -387,12 +389,31 @@ impl App {
     }
 
     pub async fn update_assets(&self, owner_id: &str, body: &Value) -> Result<(), DbError> {
+        if !body.is_object() {
+            return Err(DbError::Validation);
+        }
         let ids = string_list(body.get("ids"))?;
-        for id in ids {
-            if self.asset_record(owner_id, &id).await.is_err() {
-                continue;
+        for id in &ids {
+            if !is_uuid_v4(id) {
+                return Err(DbError::Validation);
             }
-            self.apply_asset_update(owner_id, &id, body).await?;
+        }
+        if let Some(duplicate_id) = body.get("duplicateId") {
+            if !duplicate_id.is_null() && duplicate_id.as_str().is_none() {
+                return Err(DbError::Validation);
+            }
+        }
+        for id in &ids {
+            match self.asset_record(owner_id, id).await {
+                Ok(record) if record.visibility != "locked" => {}
+                Ok(_) | Err(DbError::NotFound) => {
+                    return Err(DbError::BadRequest("Not found or no asset.update access"));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        for id in &ids {
+            self.apply_asset_update(owner_id, id, body).await?;
         }
         Ok(())
     }
@@ -717,15 +738,21 @@ impl App {
                 record.rating = Some(rating.as_i64().ok_or(DbError::Validation)?);
             }
         }
+        let duplicate_id = match body.get("duplicateId") {
+            None => record.duplicate_id.clone(),
+            Some(value) if value.is_null() => None,
+            Some(value) => Some(value.as_str().ok_or(DbError::Validation)?.to_string()),
+        };
         let now = now_iso();
         let update_id = new_update_id();
         sqlx::query(
-            "UPDATE asset SET isFavorite = ?, visibility = ?, livePhotoVideoId = ?, updatedAt = ?, updateId = ?
+            "UPDATE asset SET isFavorite = ?, visibility = ?, livePhotoVideoId = ?, duplicateId = ?, updatedAt = ?, updateId = ?
              WHERE id = ? AND ownerId = ?",
         )
         .bind(record.is_favorite)
         .bind(&record.visibility)
         .bind(&record.live_photo_video_id)
+        .bind(&duplicate_id)
         .bind(&now)
         .bind(&update_id)
         .bind(id)
@@ -748,7 +775,7 @@ impl App {
         Ok(())
     }
 
-    async fn purge_asset(&self, owner_id: &str, id: &str) -> Result<bool, DbError> {
+    pub(crate) async fn purge_asset(&self, owner_id: &str, id: &str) -> Result<bool, DbError> {
         let Some(record) = ({
             let sql = format!("{ASSET_SQL} WHERE asset.id = ? AND asset.ownerId = ?");
             sqlx::query_as::<_, AssetRecord>(&sql)
@@ -1224,6 +1251,10 @@ pub(crate) fn sync_exif_json(record: &AssetRecord) -> Value {
         "rating": record.rating,
         "fps": null,
     })
+}
+
+fn is_uuid_v4(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|id| id.get_version() == Some(uuid::Version::Random))
 }
 
 fn string_list(value: Option<&Value>) -> Result<Vec<String>, DbError> {

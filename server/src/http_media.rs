@@ -319,11 +319,21 @@ async fn update_asset(
 }
 
 async fn bulk_update_assets(State(app): State<App>, request: Request) -> Response {
-    let (session, body) = match json_body(&app, request).await {
-        Ok(value) => value,
+    let headers = request.headers().clone();
+    let raw_query = request.uri().query().unwrap_or("").to_string();
+    let user_id = match crate::http_duplicates::signed_in(&app, &headers, &raw_query).await {
+        Ok(user_id) => user_id,
         Err(response) => return response,
     };
-    match app.update_assets(&session.user.id, &body).await {
+    let bytes = match axum::body::to_bytes(request.into_body(), 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return message(StatusCode::BAD_REQUEST, "Validation failed"),
+    };
+    let body: Value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) if value.is_object() => value,
+        _ => return message(StatusCode::BAD_REQUEST, "Validation failed"),
+    };
+    match app.update_assets(&user_id, &body).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => db_error(error),
     }

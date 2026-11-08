@@ -285,7 +285,7 @@ fn ml_endpoint(base: &str, relative: &str) -> Option<String> {
     Some(base.join(relative).ok()?.to_string())
 }
 
-fn floats_to_bytes(values: &[f32]) -> Vec<u8> {
+pub(crate) fn floats_to_bytes(values: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(values.len() * 4);
     for value in values {
         bytes.extend(value.to_le_bytes());
@@ -293,7 +293,7 @@ fn floats_to_bytes(values: &[f32]) -> Vec<u8> {
     bytes
 }
 
-fn bytes_to_floats(bytes: &[u8]) -> Option<Vec<f32>> {
+pub(crate) fn bytes_to_floats(bytes: &[u8]) -> Option<Vec<f32>> {
     if bytes.len() % 4 != 0 {
         return None;
     }
@@ -305,7 +305,7 @@ fn bytes_to_floats(bytes: &[u8]) -> Option<Vec<f32>> {
     )
 }
 
-fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
+pub(crate) fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
     let mut dot = 0.0f32;
     let mut left_norm = 0.0f32;
     let mut right_norm = 0.0f32;
