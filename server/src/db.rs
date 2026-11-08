@@ -874,6 +874,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 17 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V17.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (17)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -1462,6 +1480,23 @@ CREATE TABLE integrity_report (
     UNIQUE (path, type)
 );
 CREATE INDEX integrity_report_type ON integrity_report(type, id);
+";
+
+const SCHEMA_V17: &str = "
+CREATE TABLE library (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    ownerId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    importPaths TEXT NOT NULL,
+    exclusionPatterns TEXT NOT NULL,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    deletedAt TEXT,
+    refreshedAt TEXT,
+    updateId TEXT NOT NULL
+);
+CREATE INDEX library_owner ON library(ownerId);
+CREATE INDEX library_update ON library(updateId);
 ";
 
 struct LiveSocket {

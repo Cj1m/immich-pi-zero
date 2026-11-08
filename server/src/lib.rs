@@ -3,6 +3,8 @@
 mod account;
 mod admin;
 mod http_admin;
+mod libraries;
+mod http_libraries;
 mod activity;
 mod albums;
 mod browse;
