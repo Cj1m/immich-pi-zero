@@ -671,10 +671,12 @@ impl App {
     }
 
     /// Writes one in-app notification and tells that user's open socket. No mail is sent.
+    /// `kind` is stored as the notification type (`info`, `ClusterGroupRequest`, …).
     #[doc(hidden)]
     pub async fn create_notification(
         &self,
         user_id: &str,
+        kind: &str,
         title: &str,
         description: Option<&str>,
         data: Option<Value>,
@@ -691,13 +693,14 @@ impl App {
             "INSERT INTO notification (
                 id, createdAt, updatedAt, deletedAt, updateId, userId, level, type,
                 data, title, description, readAt
-             ) VALUES (?, ?, ?, NULL, ?, ?, 'info', 'info', ?, ?, ?, NULL)",
+             ) VALUES (?, ?, ?, NULL, ?, ?, 'info', ?, ?, ?, ?, NULL)",
         )
         .bind(&id)
         .bind(&now)
         .bind(&now)
         .bind(new_update_id())
         .bind(user_id)
+        .bind(kind)
         .bind(&stored)
         .bind(title)
         .bind(description)
@@ -707,7 +710,7 @@ impl App {
             id,
             created_at: now,
             level: "info".to_string(),
-            kind: "info".to_string(),
+            kind: kind.to_string(),
             title: title.to_string(),
             description: description.map(str::to_string),
             data: stored,

@@ -641,6 +641,7 @@ async fn signed_in_account_settings() {
     let note = app
         .create_notification(
             &admin_id,
+            "info",
             "Library ready",
             Some("Thumbnails finished"),
             Some(serde_json::json!({ "albumId": album_id })),
@@ -676,7 +677,7 @@ async fn signed_in_account_settings() {
     assert!(unread[0].get("readAt").is_none());
 
     let guest_note = app
-        .create_notification(&guest_id, "Guest only", None, None)
+        .create_notification(&guest_id, "info", "Guest only", None, None)
         .await
         .unwrap();
     let (status, body) = call(
@@ -726,7 +727,7 @@ async fn signed_in_account_settings() {
     assert!(unread.as_array().unwrap().is_empty());
 
     let extra = app
-        .create_notification(&admin_id, "Second", None, None)
+        .create_notification(&admin_id, "info", "Second", None, None)
         .await
         .unwrap();
     let (status, _) = call(

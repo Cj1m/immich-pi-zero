@@ -838,6 +838,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 15 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V15.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (15)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -1380,6 +1398,25 @@ CREATE TABLE workflow_log (
 );
 CREATE INDEX workflow_log_workflow ON workflow_log(workflowId);
 CREATE INDEX workflow_log_step ON workflow_log(workflowStepId);
+";
+
+const SCHEMA_V15: &str = "
+CREATE TABLE cluster_group (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    updateId TEXT NOT NULL
+);
+CREATE INDEX cluster_group_update ON cluster_group(updateId);
+CREATE TABLE cluster_group_request (
+    id TEXT PRIMARY KEY NOT NULL,
+    clusterGroupId TEXT NOT NULL REFERENCES cluster_group(id) ON DELETE CASCADE,
+    userId TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+    createdAt TEXT NOT NULL,
+    UNIQUE (clusterGroupId, userId)
+);
+CREATE INDEX cluster_group_request_user ON cluster_group_request(userId);
 ";
 
 struct LiveSocket {
