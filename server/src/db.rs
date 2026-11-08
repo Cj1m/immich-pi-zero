@@ -95,7 +95,7 @@ impl App {
         let dummy_password_hash =
             bcrypt::hash("immich-login-dummy", 10).map_err(StartupError::Hash)?;
         let store = crate::store::Store::open(config).map_err(StartupError::Io)?;
-        Ok(Self {
+        let app = Self {
             pool,
             dummy_password_hash,
             store: std::sync::Arc::new(store),
@@ -105,7 +105,11 @@ impl App {
             machine_learning_enabled: config.machine_learning_enabled,
             config_file_locked: config.config_file.is_some(),
             log_level_locked: config.log_level.is_some(),
-        })
+        };
+        if let Err(error) = crate::ml::discard_mismatched_clip(&app).await {
+            eprintln!("clip: {error}");
+        }
+        Ok(app)
     }
 
     pub async fn login(
@@ -519,6 +523,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 4 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V4.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (4)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -750,6 +772,13 @@ CREATE TABLE shared_link_asset (
     assetId TEXT NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
     sharedLinkId TEXT NOT NULL REFERENCES shared_link(id) ON DELETE CASCADE,
     PRIMARY KEY (sharedLinkId, assetId)
+);
+";
+
+const SCHEMA_V4: &str = "
+CREATE TABLE asset_clip (
+    assetId TEXT PRIMARY KEY NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+    embedding BLOB NOT NULL
 );
 ";
 

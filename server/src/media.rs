@@ -251,6 +251,16 @@ impl App {
             }
             return Err(error);
         }
+        if asset_type == "IMAGE" && thumbs.is_some() && file.visibility != "hidden" {
+            let preview = self
+                .data_dir()
+                .join("thumbs")
+                .join(&asset_id)
+                .join("preview.jpg");
+            if let Err(error) = crate::ml::encode_asset_clip(self, &asset_id, &preview).await {
+                eprintln!("clip encode: {error}");
+            }
+        }
         Ok(IngestResult::Created(asset_id))
     }
 

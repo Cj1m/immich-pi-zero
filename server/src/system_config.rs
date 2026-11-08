@@ -92,6 +92,26 @@ const CLIP_MODELS: &[&str] = &[
     "ViT-gopt-16-SigLIP2-384__webli",
 ];
 
+/// Embedding length for each name in `CLIP_MODELS`, from v3.3.6 `CLIP_MODEL_INFO`.
+const CLIP_DIMS: &[usize] = &[
+    512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 640, 640, 640, 640, 768, 768, 768,
+    768, 768, 768, 768, 768, 768, 768, 768, 768, 768, 768, 768, 768, 1024, 1024, 1024, 1024, 1024,
+    1024, 1024, 1024, 1024, 1024, 1024, 1152, 1152, 1152, 768, 768, 1024, 1024, 1024, 1152, 1152,
+    1152, 1152, 1152, 1536, 1536,
+];
+
+const _: () = assert!(CLIP_MODELS.len() == CLIP_DIMS.len());
+
+pub(crate) fn clip_dimensions(name: &str) -> Option<usize> {
+    let token = name.rsplit('/').next().unwrap_or("");
+    if token.is_empty() {
+        return None;
+    }
+    let cleaned = token.replace(':', "_");
+    let index = CLIP_MODELS.iter().position(|model| *model == cleaned)?;
+    CLIP_DIMS.get(index).copied()
+}
+
 const DATE_TOKENS: &[&str] = &[
     "s", "ss", "SSS", "m", "mm", "d", "dd", "W", "WW", "h", "hh", "H", "HH", "y", "yy", "M", "MM",
     "MMM", "MMMM",
