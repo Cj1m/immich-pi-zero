@@ -613,6 +613,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 9 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V9.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (9)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -979,6 +997,23 @@ CREATE TABLE person_user (
     updateId TEXT NOT NULL,
     PRIMARY KEY (personGroupId, sharedById, sharedWithId)
 );
+";
+
+const SCHEMA_V9: &str = "
+CREATE TABLE person_audit (
+    id TEXT PRIMARY KEY NOT NULL,
+    personGroupId TEXT NOT NULL,
+    ownerId TEXT NOT NULL,
+    deletedAt TEXT NOT NULL
+);
+CREATE INDEX person_audit_owner ON person_audit(ownerId);
+CREATE TABLE asset_face_audit (
+    id TEXT PRIMARY KEY NOT NULL,
+    assetFaceId TEXT NOT NULL,
+    assetId TEXT NOT NULL,
+    deletedAt TEXT NOT NULL
+);
+CREATE INDEX asset_face_audit_asset ON asset_face_audit(assetId);
 ";
 
 async fn user_count(pool: &SqlitePool) -> Result<i64, StartupError> {

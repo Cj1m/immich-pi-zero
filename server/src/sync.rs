@@ -123,6 +123,18 @@ impl App {
                     self.write_memory_assets(&mut body, user_id, &checkpoints, &now_id)
                         .await?
                 }
+                "PeopleV1" => {
+                    self.write_people(&mut body, user_id, &checkpoints, &now_id)
+                        .await?
+                }
+                "AssetFacesV2" => {
+                    self.write_faces(&mut body, user_id, &checkpoints, &now_id, false)
+                        .await?
+                }
+                "AssetFacesV3" => {
+                    self.write_faces(&mut body, user_id, &checkpoints, &now_id, true)
+                        .await?
+                }
                 _ => {}
             }
         }
@@ -605,6 +617,152 @@ impl App {
         Ok(())
     }
 
+    async fn write_people(
+        &self,
+        body: &mut String,
+        user_id: &str,
+        checkpoints: &HashMap<String, String>,
+        now_id: &str,
+    ) -> Result<(), DbError> {
+        let deletes: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, personGroupId FROM person_audit
+             WHERE ownerId = ? AND id < ? AND (? IS NULL OR id > ?)
+             ORDER BY id",
+        )
+        .bind(user_id)
+        .bind(now_id)
+        .bind(cursor(checkpoints, "PersonDeleteV1"))
+        .bind(cursor(checkpoints, "PersonDeleteV1"))
+        .fetch_all(self.pool())
+        .await?;
+        for (audit_id, person_id) in deletes {
+            body.push_str(&sync_line(
+                "PersonDeleteV1",
+                json!({ "personId": person_id }),
+                &audit_id,
+            ));
+        }
+        let rows: Vec<SyncPerson> = sqlx::query_as(
+            "SELECT updateId AS update_id, personGroupId AS id, createdAt AS created_at, updatedAt AS updated_at,
+                    ownerId AS owner_id, name, birthDate AS birth_date, isHidden AS is_hidden,
+                    isFavorite AS is_favorite, color, faceAssetId AS face_asset_id
+             FROM person
+             WHERE ownerId = ? AND (? IS NULL OR updateId > ?) AND updateId < ?
+             ORDER BY updateId",
+        )
+        .bind(user_id)
+        .bind(cursor(checkpoints, "PersonV1"))
+        .bind(cursor(checkpoints, "PersonV1"))
+        .bind(now_id)
+        .fetch_all(self.pool())
+        .await?;
+        for person in rows {
+            body.push_str(&sync_line(
+                "PersonV1",
+                json!({
+                    "id": person.id,
+                    "createdAt": person.created_at,
+                    "updatedAt": person.updated_at,
+                    "ownerId": person.owner_id,
+                    "name": person.name,
+                    "birthDate": sync_birth(person.birth_date),
+                    "isHidden": person.is_hidden != 0,
+                    "isFavorite": person.is_favorite != 0,
+                    "color": person.color,
+                    "faceAssetId": person.face_asset_id,
+                }),
+                &person.update_id,
+            ));
+        }
+        Ok(())
+    }
+
+    async fn write_faces(
+        &self,
+        body: &mut String,
+        user_id: &str,
+        checkpoints: &HashMap<String, String>,
+        now_id: &str,
+        cluster: bool,
+    ) -> Result<(), DbError> {
+        let face_type = if cluster {
+            "AssetFaceV3"
+        } else {
+            "AssetFaceV2"
+        };
+        let delete_sql = format!(
+            "SELECT asset_face_audit.id, asset_face_audit.assetFaceId
+             FROM asset_face_audit
+             JOIN asset ON asset.id = asset_face_audit.assetId
+             JOIN user AS owner ON owner.id = asset.ownerId
+             WHERE {FACE_OWNER}
+               AND asset_face_audit.id < ?
+               AND (? IS NULL OR asset_face_audit.id > ?)
+             ORDER BY asset_face_audit.id"
+        );
+        let deletes: Vec<(String, String)> = sqlx::query_as(&delete_sql)
+            .bind(user_id)
+            .bind(i64::from(cluster))
+            .bind(user_id)
+            .bind(now_id)
+            .bind(cursor(checkpoints, "AssetFaceDeleteV1"))
+            .bind(cursor(checkpoints, "AssetFaceDeleteV1"))
+            .fetch_all(self.pool())
+            .await?;
+        for (audit_id, face_id) in deletes {
+            body.push_str(&sync_line(
+                "AssetFaceDeleteV1",
+                json!({ "assetFaceId": face_id }),
+                &audit_id,
+            ));
+        }
+        let face_sql = format!(
+            "SELECT asset_face.updateId AS update_id, asset_face.id AS id, asset_face.assetId AS asset_id,
+                    asset_face.personGroupId AS person_id, asset_face.imageWidth AS image_width,
+                    asset_face.imageHeight AS image_height, asset_face.boundingBoxX1 AS x1,
+                    asset_face.boundingBoxY1 AS y1, asset_face.boundingBoxX2 AS x2, asset_face.boundingBoxY2 AS y2,
+                    asset_face.sourceType AS source_type, asset_face.isVisible AS is_visible,
+                    asset_face.deletedAt AS deleted_at
+             FROM asset_face
+             JOIN asset ON asset.id = asset_face.assetId
+             JOIN user AS owner ON owner.id = asset.ownerId
+             WHERE {FACE_OWNER}
+               AND (? IS NULL OR asset_face.updateId > ?)
+               AND asset_face.updateId < ?
+             ORDER BY asset_face.updateId"
+        );
+        let rows: Vec<SyncFace> = sqlx::query_as(&face_sql)
+            .bind(user_id)
+            .bind(i64::from(cluster))
+            .bind(user_id)
+            .bind(cursor(checkpoints, face_type))
+            .bind(cursor(checkpoints, face_type))
+            .bind(now_id)
+            .fetch_all(self.pool())
+            .await?;
+        for face in rows {
+            body.push_str(&sync_line(
+                face_type,
+                json!({
+                    "id": face.id,
+                    "assetId": face.asset_id,
+                    "personId": face.person_id,
+                    "imageWidth": face.image_width,
+                    "imageHeight": face.image_height,
+                    "boundingBoxX1": face.x1,
+                    "boundingBoxY1": face.y1,
+                    "boundingBoxX2": face.x2,
+                    "boundingBoxY2": face.y2,
+                    "sourceType": face.source_type,
+                    "deletedAt": face.deleted_at,
+                    "isVisible": face.is_visible != 0,
+                }),
+                &face.update_id,
+            ));
+        }
+        Ok(())
+    }
+
     async fn user_sync_row(
         &self,
         user_id: &str,
@@ -718,6 +876,54 @@ fn user_sync_json(user: &UserSyncRow, auth: bool) -> Value {
         data["quotaUsageInBytes"] = json!(user.quota_usage_in_bytes);
     }
     data
+}
+
+const FACE_OWNER: &str = "
+    (asset.ownerId = ? OR (
+        ? = 1
+        AND owner.clusterGroupId IS NOT NULL
+        AND owner.clusterGroupId = (SELECT clusterGroupId FROM user WHERE id = ?)
+    ))
+";
+
+#[derive(sqlx::FromRow)]
+struct SyncPerson {
+    update_id: String,
+    id: String,
+    created_at: String,
+    updated_at: String,
+    owner_id: String,
+    name: String,
+    birth_date: Option<String>,
+    is_hidden: i64,
+    is_favorite: i64,
+    color: Option<String>,
+    face_asset_id: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SyncFace {
+    update_id: String,
+    id: String,
+    asset_id: String,
+    person_id: Option<String>,
+    image_width: i64,
+    image_height: i64,
+    x1: i64,
+    y1: i64,
+    x2: i64,
+    y2: i64,
+    source_type: String,
+    is_visible: i64,
+    deleted_at: Option<String>,
+}
+
+fn sync_birth(value: Option<String>) -> Value {
+    match value {
+        None => Value::Null,
+        Some(value) if value.contains('T') => Value::String(value),
+        Some(value) => Value::String(format!("{value}T00:00:00.000Z")),
+    }
 }
 
 fn sync_line(kind: &str, data: Value, update_id: &str) -> String {

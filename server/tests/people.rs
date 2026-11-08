@@ -110,15 +110,16 @@ async fn insert_person(
 ) -> String {
     let person_id = uuid::Uuid::new_v4().to_string();
     let now = "2020-01-02T03:04:05.000Z";
+    let update_id = uuid::Uuid::now_v7().to_string();
     sqlx::query(
         "INSERT INTO person_group (id, clusterGroupId, createdAt, createId, updatedAt, updateId)
          VALUES (?, NULL, ?, ?, ?, ?)",
     )
     .bind(&person_id)
     .bind(now)
+    .bind(&update_id)
     .bind(now)
-    .bind(now)
-    .bind(now)
+    .bind(&update_id)
     .execute(app.pool())
     .await
     .unwrap();
@@ -134,7 +135,7 @@ async fn insert_person(
     .bind(now)
     .bind(name)
     .bind(hidden)
-    .bind(now)
+    .bind(uuid::Uuid::now_v7().to_string())
     .execute(app.pool())
     .await
     .unwrap();
@@ -152,7 +153,7 @@ async fn insert_person(
         .bind(index)
         .bind(index + 2)
         .bind(now)
-        .bind(now)
+        .bind(uuid::Uuid::now_v7().to_string())
         .bind(owner)
         .execute(app.pool())
         .await
@@ -507,6 +508,94 @@ async fn people_list_search_and_shares() {
     let cleared: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(status, 200, "{cleared}");
     assert_eq!(cleared.as_array().unwrap().len(), 0);
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/sync/stream",
+            Some(&cookie),
+            Some(r#"{"types":["AssetFacesV1"]}"#),
+        ),
+    )
+    .await;
+    let deprecated: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 400, "{deprecated}");
+    assert_eq!(
+        deprecated["message"],
+        "SyncRequestType.AssetFacesV1 is deprecated, use SyncRequestType.AssetFacesV2 instead"
+    );
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/sync/stream",
+            Some(&cookie),
+            Some(r#"{"types":["PeopleV1","AssetFacesV3"]}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let lines: Vec<Value> = String::from_utf8(body)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let people: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["type"] == "PersonV1")
+        .collect();
+    assert_eq!(people.len(), 4);
+    let ada_line = people
+        .iter()
+        .find(|line| line["data"]["id"] == ada)
+        .unwrap();
+    assert_eq!(ada_line["data"]["name"], "Ada Lovelace");
+    assert_eq!(ada_line["data"]["birthDate"], "1815-12-10T00:00:00.000Z");
+    assert_eq!(ada_line["data"]["isFavorite"], true);
+    assert_eq!(ada_line["data"]["isHidden"], false);
+    assert_eq!(ada_line["data"]["ownerId"], user_id);
+    assert_eq!(ada_line["data"]["color"], Value::Null);
+    assert_eq!(ada_line["data"]["faceAssetId"], Value::Null);
+    let faces: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["type"] == "AssetFaceV3")
+        .collect();
+    assert_eq!(faces.len(), 6);
+    assert!(faces
+        .iter()
+        .any(|line| line["data"]["personId"] == ada && line["data"]["isVisible"] == true));
+    assert!(lines.iter().any(|line| line["type"] == "SyncCompleteV1"));
+
+    let person_ack = people.last().unwrap()["ack"].as_str().unwrap();
+    let face_ack = faces.last().unwrap()["ack"].as_str().unwrap();
+    let (status, _) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/sync/ack",
+            Some(&cookie),
+            Some(&format!(r#"{{"acks":["{person_ack}","{face_ack}"]}}"#)),
+        ),
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/sync/stream",
+            Some(&cookie),
+            Some(r#"{"types":["PeopleV1","AssetFacesV3"]}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let again = String::from_utf8(body).unwrap();
+    assert!(!again.contains("PersonV1"));
+    assert!(!again.contains("AssetFaceV3"));
+    assert!(again.contains("SyncCompleteV1"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
