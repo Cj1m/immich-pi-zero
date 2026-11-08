@@ -856,6 +856,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 16 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V16.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (16)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -1417,6 +1435,33 @@ CREATE TABLE cluster_group_request (
     UNIQUE (clusterGroupId, userId)
 );
 CREATE INDEX cluster_group_request_user ON cluster_group_request(userId);
+";
+
+const SCHEMA_V16: &str = "
+CREATE TABLE queue_state (
+    name TEXT PRIMARY KEY NOT NULL,
+    isPaused INTEGER NOT NULL DEFAULT 0,
+    completed INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE queue_job (
+    id TEXT PRIMARY KEY NOT NULL,
+    queueName TEXT NOT NULL,
+    name TEXT NOT NULL,
+    data TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    status TEXT NOT NULL
+);
+CREATE INDEX queue_job_queue ON queue_job(queueName, status);
+CREATE TABLE integrity_report (
+    id TEXT PRIMARY KEY NOT NULL,
+    type TEXT NOT NULL,
+    path TEXT NOT NULL,
+    assetId TEXT,
+    fileAssetId TEXT,
+    createdAt TEXT NOT NULL,
+    UNIQUE (path, type)
+);
+CREATE INDEX integrity_report_type ON integrity_report(type, id);
 ";
 
 struct LiveSocket {

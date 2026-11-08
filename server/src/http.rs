@@ -45,6 +45,7 @@ pub fn router(app: App) -> Router {
         .merge(crate::http_plugins::routes())
         .merge(crate::http_workflows::routes())
         .merge(crate::http_clusters::routes())
+        .merge(crate::http_admin::routes())
         .merge(crate::http_media::routes())
         .merge(crate::http_shares::routes())
         .fallback(crate::web::browser_document)
@@ -149,7 +150,12 @@ async fn current_user(State(app): State<App>, request: Request) -> Response {
         Ok(session) => session,
         Err(response) => return response,
     };
-    json_ok(user_json(&session.user))
+    let mut body = user_json(&session.user);
+    match app.user_license_value(&session.user.id).await {
+        Ok(license) => body["license"] = license,
+        Err(error) => return db_error(error),
+    }
+    json_ok(body)
 }
 
 async fn preferences(State(app): State<App>, request: Request) -> Response {
@@ -334,7 +340,7 @@ fn browser_and_os(user_agent: &str) -> (String, String) {
     (browser.to_string(), os.to_string())
 }
 
-fn request_is_secure(request: &Request<Body>) -> bool {
+pub(crate) fn request_is_secure(request: &Request<Body>) -> bool {
     if request.uri().scheme_str() == Some("https") {
         return true;
     }

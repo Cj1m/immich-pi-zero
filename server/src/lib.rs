@@ -1,6 +1,8 @@
 //! Pi Immich server. Responses match Immich v3.3.6 where the official mobile app or web UI can see them.
 
 mod account;
+mod admin;
+mod http_admin;
 mod activity;
 mod albums;
 mod browse;
