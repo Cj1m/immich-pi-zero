@@ -1,0 +1,32 @@
+# Decide which account-settings responses this server matches
+
+Type: grilling
+Status: resolved
+
+## Question
+
+User settings, beside the library, calls `GET`, `POST`, `PUT`, and `DELETE /api/api-keys`, `POST /api/api-keys/{id}/rotate`, `GET /api/sessions`, `DELETE /api/sessions`, `DELETE /api/sessions/{id}`, `POST /api/users/profile-image`, `GET` and `PUT /api/notifications`, `PUT /api/notifications/{id}`, `PUT /api/users/me/preferences`, `GET /api/assets/statistics`, and `GET /api/users/me/calendar-heatmap`. Password, onboarding, and the admin session list are already decided. License stays with the purchase fog. Where the official web UI can see a behavior, match v3.3.6. A difference is allowed when the Pi cannot do it. Do these account-settings calls match v3.3.6?
+
+## Comments
+
+Recommendation accepted: these calls match v3.3.6. The API key row and the notification row are new stored rows. Preferences stay the metadata document from [Decide which later-user responses this server matches](issues/36-decide-which-later-user-responses-this-server-matches.md). Album counts on the same page stay [Decide which signed-in album responses this server matches](issues/60-decide-which-signed-in-album-responses-this-server-matches.md). Mail is still not sent, as [Decide how an operator sets the machine-learning URL and object-storage credentials](issues/40-decide-how-an-operator-sets-the-machine-learning-url-and-object-storage-credentials.md) set. The in-app notification row is still created. There is no new Pi difference.
+
+## Answer
+
+`api_key` keeps `id`, `name`, `key` (SHA-256 blob), `userId`, `createdAt`, `updatedAt`, `permissions` (JSON text of permission names), and `updateId`. The list never returns `key`.
+
+`GET /api/api-keys` returns 200 of `{id, name, createdAt, updatedAt, permissions}`. None is `[]`. The page reads `name` and `permissions`. `POST /api/api-keys` returns 201 of that document plus `secret` (the raw token, shown once) and a nested `apiKey` of the same document. The secret modal reads `secret`. An omitted name is stored as `API Key`. Permissions must be a non-empty list or the body is 400. An API-key caller that grants a permission it does not hold is 400 `Cannot grant permissions you do not have`. `PUT /api/api-keys/{id}` returns 200 of the document. A missing key is 400 `API Key not found`. `POST /api/api-keys/{id}/rotate` returns 201 in the create shape with a new `secret` and replaces the stored hash. A missing key is 400 `API Key not found`. An API-key caller that lacks the key's permissions is 400 `Cannot rotate an API Key with permissions you do not have`. `DELETE /api/api-keys/{id}` returns 204. A missing key is 400 `API Key not found`. The phone does not sync API keys. A deleted key's next request is 401.
+
+`GET /api/sessions` returns 200 of this user's sessions: `id`, `createdAt`, `updatedAt`, `expiresAt` (omitted when null), `current`, `deviceType`, `deviceOS`, `appVersion`, `isPendingSyncReset`. `current` is true only for the calling session. The device card reads `current`, `deviceOS`, `deviceType`, and `appVersion`. None is `[]`. `DELETE /api/sessions/{id}` returns 204 and removes that row. No access is 400 `Not found or no authDevice.delete access`. `DELETE /api/sessions` returns 204 and removes every other session for this user. The calling session stays. An API-key caller has no session, so this call removes every session for the user. A removed session's next request is 401 `Invalid user token`.
+
+`POST /api/users/profile-image` is multipart `file` and returns 201 `{userId, profileImagePath, profileChangedAt}`. The file is a thumbnail written on local disk under the profile folder, using the same thumbnail format, quality, and size as an asset thumbnail. `user.profileImagePath` and `profileChangedAt` update. The previous file is deleted. A file that cannot be decoded is 400 `Unable to process profile image`, and the upload is deleted. The next user sync sets `hasProfileImage` from that path. `GET /api/users/{id}/profile-image` stays the file read already decided: an empty path is 404.
+
+`notification` keeps `id`, `createdAt`, `updatedAt`, `deletedAt`, `updateId`, `userId`, `level` (default `info`), `type` (default `info`), `data` (JSON, null allowed), `title`, `description`, and `readAt`. The document is `id`, `createdAt`, `level`, `type`, `title`, `description` (omitted when null), `data` (the JSON object, omitted when null), and `readAt` (omitted when null). The panel reads `id`, `type`, `level`, `title`, `description`, and `data`. `GET /api/notifications?unread=true` returns 200, newest `createdAt` first, `readAt` null, not soft-deleted. None is `[]`. `PUT /api/notifications` returns 204. The body is `ids` (at least one) and `readAt`. No access is 400 `Not found or no notification.update access`. `PUT /api/notifications/{id}` returns 200 of the document and sets `readAt`. The same access miss is 400 `Not found or no notification.update access`. Creating a row sends `on_notification` to that user. The bell ignores the payload and calls the unread list again. No email is sent.
+
+`PUT /api/users/me/preferences` returns 200 and the full preferences document. The body merges onto the stored `preferences` metadata. A missing parent in the response still throws, so the merged document keeps every default parent.
+
+`GET /api/assets/statistics` returns 200 `{images, videos, total}`. `total` counts every type, including audio and other. The page reads all three. Timeline sends `visibility=timeline`. Favorites sends `isFavorite=true`. Archive sends `visibility=archive`. Trash sends `isTrashed=true`. An omitted visibility keeps timeline and archive. Trash counts rows with `deletedAt` set whose status is not deleted. The other three counts leave out deleted rows. `visibility=locked` without elevation is 401 `Elevated permission is required`. The usage page does not send that.
+
+`GET /api/users/me/calendar-heatmap` returns 200 `{from, to, series, totalCount}`, the same document as the admin heatmap. Each series item is `date` (`yyyy-mm-dd`) and `count`. The range is one UTC day from `from` through `to`, and a day with no asset is `count` 0. Omitted `from` is 52 weeks back from `to`. Omitted `to` is today. Omitted type is `Upload`, which groups `createdAt`. `Taken` groups `localDateTime`. `totalCount` is the sum. The page reads `series` and `totalCount` and sends `from` and `to`. Hard-deleted assets are left out.
+
+Unsigned is 401. A shared link is 403 `Forbidden`.

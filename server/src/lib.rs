@@ -1,0 +1,38 @@
+//! Pi Immich server. Responses match Immich v3.3.6 where the official mobile app or web UI can see them.
+
+mod albums;
+mod config;
+mod db;
+mod http;
+mod http_media;
+mod media;
+mod store;
+mod sync;
+mod thumbs;
+
+use std::net::SocketAddr;
+
+pub use config::{Config, StartupError};
+pub use db::App;
+pub use http::router;
+
+/// Open the database, create the first admin when the server has no User, and serve HTTP.
+pub fn run() -> Result<(), StartupError> {
+    let config = Config::from_env()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| StartupError::Io(std::io::Error::other(error)))?;
+    runtime.block_on(async move {
+        let app = App::prepare(&config).await?;
+        let address = SocketAddr::new(config.host, config.port);
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .map_err(StartupError::Io)?;
+        eprintln!("immich listening on {address}");
+        axum::serve(listener, http::router(app))
+            .await
+            .map_err(StartupError::Io)?;
+        Ok(())
+    })
+}

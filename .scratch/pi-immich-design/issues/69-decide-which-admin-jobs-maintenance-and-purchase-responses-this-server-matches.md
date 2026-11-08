@@ -1,0 +1,34 @@
+# Decide which admin jobs, maintenance, and purchase responses this server matches
+
+Type: grilling
+Status: resolved
+
+## Question
+
+The admin jobs screen redirects to the queues. That screen calls `GET /api/queues`, `GET /api/queues/{name}`, `PUT /api/queues/{name}`, `GET /api/queues/{name}/jobs`, and `DELETE /api/queues/{name}/jobs`. Maintenance calls `GET /api/admin/maintenance/status`, `POST /api/admin/maintenance`, `POST /api/admin/maintenance/login`, `GET /api/admin/database-backups`, and the integrity summary and report. SMTP delivery beyond the saved settings is the test email. The purchase page calls the server and user license routes and reads `licensed` on about. The admin server-status page calls `GET /api/server/statistics`. The user-delete job is already decided. Video transcode stays out of scope. The ffmpeg keys are already in the admin config. Where the official web UI can see a behavior, match v3.3.6. A difference is allowed when the Pi cannot do it. Do these calls match v3.3.6?
+
+## Comments
+
+Recommendation accepted: the queue documents, the license documents, and the integrity documents match v3.3.6. Starting the video queue still writes no encoded video. A database backup is not a Postgres dump, because this server stores metadata in SQLite. The test email does not send. User delete stays [Decide which user update, delete, and restore responses this server matches](issues/41-decide-which-user-update-delete-and-restore-responses-this-server-matches.md). Duplicate detection stays [Decide which duplicate responses this server matches](issues/48-decide-which-duplicate-responses-this-server-matches.md). `features.email` stays false, as [Decide how an operator sets the machine-learning URL and object-storage credentials](issues/40-decide-how-an-operator-sets-the-machine-learning-url-and-object-storage-credentials.md) set.
+
+## Answer
+
+A non-admin on these admin routes is 403. Unsigned is 401, except maintenance status and maintenance login, which are public.
+
+`GET /api/queues` returns 200, one item per queue name: `thumbnailGeneration`, `metadataExtraction`, `videoConversion`, `faceDetection`, `facialRecognition`, `smartSearch`, `duplicateDetection`, `backgroundTask`, `storageTemplateMigration`, `migration`, `search`, `sidecar`, `library`, `notifications`, `backupDatabase`, `ocr`, `workflow`, `integrityCheck`, and `editor`. Each item is `{name, isPaused, statistics}`. `statistics` is `active`, `completed`, `failed`, `delayed`, `waiting`, and `paused`. The card reads `isPaused` and those counts. `GET /api/queues/{name}` returns 200 of that one item. `PUT /api/queues/{name}` returns 200. `isPaused` true pauses the queue. Pausing `backgroundTask` is 400 `The BackgroundTask queue cannot be paused`. `isPaused` false resumes it. `GET /api/queues/{name}/jobs` returns 200 of `{id, name, data, timestamp}`. `DELETE /api/queues/{name}/jobs` returns 204 and empties the queue. `failed` true also clears failed jobs.
+
+`POST /api/jobs` returns 204. The body name is one of `person-cleanup`, `tag-cleanup`, `user-cleanup`, `memory-cleanup`, `memory-create`, `backup-database`, and the integrity names below. Any other name is 400 `Invalid job name`. `user-cleanup` is the user-delete check already decided. `backup-database` does not write a Postgres dump. Face, smart-search, and OCR work stay the ML client. Starting `videoConversion` returns the queue document and writes no encoded video. Starting a queue that is already active is 400 `Job is already running`.
+
+`GET /api/admin/maintenance/status` returns 200 `{active: false, action: "end"}` while maintenance is off. `POST /api/admin/maintenance/login` is then 400 `Not in maintenance mode`. `POST /api/admin/maintenance` with `action` `end` changes nothing. Any other action stores maintenance mode and sets the `immich_maintenance_token` cookie. `restore_database` without `restoreBackupFilename` is a 400 validation error. Restoring a `.sql` or `.sql.gz` dump does not load it into SQLite. That is the Pi difference for restore.
+
+`GET /api/admin/database-backups` returns 200 `{backups}`. Each item is `{filename, filesize, timezone}`. A name must match a `.sql` or `.sql.gz` file of letters, digits, `_`, `-`, and `.`. Others are left out. None is `{backups: []}`. An invalid delete or download name is 400 `Invalid backup name!`.
+
+`integrity_report` keeps `id`, `type`, `path`, `assetId`, `fileAssetId`, and `createdAt`. `GET /api/admin/integrity/summary` returns 200 with `untracked_file`, `missing_file`, and `checksum_mismatch`, each a count, and 0 when that type has no row. `GET /api/admin/integrity/report` returns 200 `{items, nextCursor}`. An item is `{id, type, path}`. The page sends `type`. Default limit is 500. The missing-file check looks for the Original in object storage and for the local thumbnail and preview. An object that is stored is not missing. An untracked file is a file in those places with no row. A checksum failure is a stored checksum that does not match the object bytes. `GET /api/admin/integrity/report/{type}/csv` returns `text/csv` with the header `id,type,assetId,fileAssetId,path`.
+
+`POST /api/admin/notifications/test-email` returns 400 `Failed to verify SMTP configuration`. No message is sent. `POST /api/admin/notifications/templates/{name}` still returns 200 `{name, html}` for the preview. `GET /api/server/features` keeps `email` false.
+
+A license document is `{licenseKey, activationKey, activatedAt}`. The key shape is `IMSV-` or `IMCL-` and then eight groups of four. `GET /api/server/license` returns 200 of the server document, or 404 when none is stored. `PUT /api/server/license` returns 200. The key must start with `IMSV-` and the activation key must verify with the server public key, or the call is 400 `Invalid license key`. `activatedAt` is now. `DELETE /api/server/license` returns 204. `GET /api/server/about` includes `licensed`, true when that server document is stored. The purchase page reads `licensed`.
+
+`GET /api/users/me/license` returns 200 of the user document, or 404 when none is stored. The purchase page treats 404 as no key. `PUT /api/users/me/license` returns 200. The key must start with `IMCL-` or `IMSV-` and verify with either public key, or the call is 400 `Invalid license key`. The document is stored on the user metadata key `license`. `GET /api/users/me` then includes it, and null when it is absent. `DELETE /api/users/me/license` returns 204. The support-badge switch stays the preferences write already decided.
+
+`GET /api/server/statistics` returns 200 `{photos, videos, usage, usagePhotos, usageVideos, usageByUser}`. Each user row is `{userId, userName, photos, videos, usage, usagePhotos, usageVideos, quotaSizeInBytes}`. The status page reads `photos`, `videos`, and `usage`. Counts are this server's assets. Usage is their byte size.
