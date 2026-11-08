@@ -900,6 +900,7 @@ dependencies = [
  "http-body-util",
  "image",
  "kamadak-exif",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

@@ -230,6 +230,26 @@ impl App {
         })
     }
 
+    /// The login page reads this. It is the public slice of the admin document.
+    pub(crate) fn public_config_body(&self, config: &Value) -> Value {
+        json!({
+            "oauth": {
+                "autoLaunch": config["oauth"]["autoLaunch"].as_bool().unwrap_or(false),
+                "buttonText": config["oauth"]["buttonText"].as_str().unwrap_or("Login with OAuth"),
+                "enabled": config["oauth"]["enabled"].as_bool().unwrap_or(false),
+            },
+            "passwordLogin": {
+                "enabled": config["passwordLogin"]["enabled"].as_bool().unwrap_or(true),
+            },
+            "server": {
+                "loginPageMessage": config["server"]["loginPageMessage"].as_str().unwrap_or(""),
+            },
+            "theme": {
+                "customCss": config["theme"]["customCss"].as_str().unwrap_or(""),
+            },
+        })
+    }
+
     async fn stored_config(&self) -> Result<Value, DbError> {
         let value: Option<String> =
             sqlx::query_scalar("SELECT value FROM system_metadata WHERE key = ?")

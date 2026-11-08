@@ -4,14 +4,12 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use chrono::TimeZone;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::db::{App, ClientDevice, DbError, UserDocument};
 
 const COOKIE_MAX_AGE_SECONDS: u64 = 400 * 24 * 60 * 60;
-const ARCHIVE_SIZE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 pub fn router(app: App) -> Router {
     Router::new()
@@ -23,9 +21,16 @@ pub fn router(app: App) -> Router {
         .route("/api/auth/login", post(login))
         .route("/api/auth/validateToken", post(validate_token))
         .route("/api/auth/logout", post(logout))
-        .route("/api/users/me", get(current_user))
-        .route("/api/users/me/preferences", get(preferences))
+        .route(
+            "/api/users/me",
+            get(current_user).put(crate::http_users::update_me),
+        )
+        .route(
+            "/api/users/me/preferences",
+            get(preferences).put(crate::http_users::update_preferences),
+        )
         .route("/api/server/media-types", get(media_types))
+        .merge(crate::http_users::routes())
         .merge(crate::http_config::routes())
         .merge(crate::http_search::routes())
         .merge(crate::http_memories::routes())
@@ -140,10 +145,14 @@ async fn current_user(State(app): State<App>, request: Request) -> Response {
 }
 
 async fn preferences(State(app): State<App>, request: Request) -> Response {
-    if let Err(response) = require_session(&app, request.headers()).await {
-        return response;
+    let session = match require_session(&app, request.headers()).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    match app.preferences_for(&session.user.id).await {
+        Ok(body) => json_ok(body),
+        Err(error) => db_error(error),
     }
-    json_ok(default_preferences())
 }
 
 async fn media_types() -> Response {
@@ -247,44 +256,6 @@ pub(crate) fn user_json(user: &UserDocument) -> Value {
         "status": user.status,
         "license": null,
     })
-}
-
-fn default_preferences() -> Value {
-    json!({
-        "albums": { "defaultAssetOrder": "desc" },
-        "folders": { "enabled": false, "sidebarWeb": false },
-        "memories": { "enabled": true, "duration": 5, "sidebarWeb": false },
-        "people": {
-            "enabled": true,
-            "sidebarWeb": false,
-            "minimumFaces": 3,
-            "updateStrategy": "everyone",
-        },
-        "sharedLinks": { "enabled": true, "sidebarWeb": false },
-        "ratings": { "enabled": false },
-        "tags": { "enabled": false, "sidebarWeb": false },
-        "emailNotifications": { "enabled": true, "albumInvite": true, "albumUpdate": true },
-        "download": {
-            "archiveSize": ARCHIVE_SIZE_BYTES,
-            "includeEmbeddedVideos": false,
-        },
-        "purchase": {
-            "showSupportBadge": true,
-            "hideBuyButtonUntil": local_date_iso(2022, 2, 12),
-        },
-        "cast": { "gCastEnabled": false },
-        "recentlyAdded": { "sidebarWeb": false },
-    })
-}
-
-fn local_date_iso(year: i32, month: u32, day: u32) -> String {
-    chrono::Local
-        .with_ymd_and_hms(year, month, day, 0, 0, 0)
-        .single()
-        .expect("local date")
-        .with_timezone(&chrono::Utc)
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string()
 }
 
 fn client_device(headers: &HeaderMap) -> ClientDevice {
@@ -412,6 +383,7 @@ pub(crate) fn db_error(error: DbError) -> Response {
         DbError::NotFound => message(StatusCode::NOT_FOUND, "Not found"),
         DbError::Validation => message(StatusCode::BAD_REQUEST, "Validation failed"),
         DbError::Quota => message(StatusCode::BAD_REQUEST, "Quota has been exceeded!"),
+        DbError::BadRequest(text) => message(StatusCode::BAD_REQUEST, text),
         DbError::Store(error) => {
             eprintln!("store: {error}");
             message(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")

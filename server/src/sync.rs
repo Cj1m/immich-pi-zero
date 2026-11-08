@@ -248,21 +248,21 @@ impl App {
     async fn write_user(
         &self,
         body: &mut String,
-        user_id: &str,
+        _user_id: &str,
         checkpoints: &HashMap<String, String>,
         now_id: &str,
     ) -> Result<(), DbError> {
-        let Some(user) = self
-            .user_sync_row(user_id, cursor(checkpoints, "UserV1"), now_id)
-            .await?
-        else {
-            return Ok(());
-        };
-        body.push_str(&sync_line(
-            "UserV1",
-            user_sync_json(&user, false),
-            &user.update_id,
-        ));
+        // Invite-people reads every user, not only the caller.
+        let users = self
+            .changed_users(cursor(checkpoints, "UserV1"), now_id)
+            .await?;
+        for user in users {
+            body.push_str(&sync_line(
+                "UserV1",
+                user_sync_json(&user, false),
+                &user.update_id,
+            ));
+        }
         Ok(())
     }
 
@@ -761,6 +761,29 @@ impl App {
             ));
         }
         Ok(())
+    }
+
+    async fn changed_users(
+        &self,
+        after: Option<&str>,
+        before: &str,
+    ) -> Result<Vec<UserSyncRow>, DbError> {
+        let rows = sqlx::query_as::<_, UserSyncRow>(
+            "SELECT id, name, email, avatarColor AS avatar_color, deletedAt AS deleted_at,
+                    profileImagePath AS profile_image_path, profileChangedAt AS profile_changed_at,
+                    isAdmin AS is_admin, pinCode AS pin_code, oauthId AS oauth_id,
+                    storageLabel AS storage_label, quotaSizeInBytes AS quota_size_in_bytes,
+                    quotaUsageInBytes AS quota_usage_in_bytes, updateId AS update_id
+             FROM user
+             WHERE (? IS NULL OR updateId > ?) AND updateId < ?
+             ORDER BY updateId",
+        )
+        .bind(after)
+        .bind(after)
+        .bind(before)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
     }
 
     async fn user_sync_row(

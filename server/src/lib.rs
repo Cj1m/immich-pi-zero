@@ -15,15 +15,17 @@ mod http_memories;
 mod http_people;
 mod http_search;
 mod http_shares;
+mod http_users;
 mod media;
 mod memories;
-mod people;
 mod ml;
+mod people;
 mod shares;
 mod store;
 mod sync;
 mod system_config;
 mod thumbs;
+mod users;
 mod web;
 
 use std::net::SocketAddr;

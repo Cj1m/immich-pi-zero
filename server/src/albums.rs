@@ -280,7 +280,7 @@ impl App {
                     .fetch_optional(self.pool())
                     .await?;
             if exists.is_none() {
-                return Err(DbError::NotFound);
+                return Err(DbError::BadRequest("Invalid user"));
             }
             let role = user
                 .get("role")

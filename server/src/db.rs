@@ -234,6 +234,63 @@ impl App {
         .await?;
         Ok(())
     }
+
+    pub(crate) async fn read_user(
+        &self,
+        id: &str,
+        with_deleted: bool,
+    ) -> Result<Option<UserDocument>, DbError> {
+        let sql = if with_deleted {
+            format!("{USER_DOCUMENT_SQL} WHERE id = ?")
+        } else {
+            format!("{USER_DOCUMENT_SQL} WHERE id = ? AND deletedAt IS NULL")
+        };
+        let row = sqlx::query_as::<_, UserRow>(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        self.document(row).await
+    }
+
+    pub(crate) async fn search_users(
+        &self,
+        with_deleted: bool,
+        id: Option<&str>,
+    ) -> Result<Vec<UserDocument>, DbError> {
+        let sql = format!(
+            "{USER_DOCUMENT_SQL} WHERE (? IS NULL OR id = ?) AND (? = 1 OR deletedAt IS NULL) ORDER BY createdAt, id"
+        );
+        let rows = sqlx::query_as::<_, UserRow>(&sql)
+            .bind(id)
+            .bind(id)
+            .bind(i64::from(with_deleted))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut documents = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(document) = self.document(Some(row)).await? {
+                documents.push(document);
+            }
+        }
+        Ok(documents)
+    }
+
+    pub(crate) async fn user_password_hash(&self, id: &str) -> Result<Option<String>, DbError> {
+        let hash: Option<Option<String>> =
+            sqlx::query_scalar("SELECT password FROM user WHERE id = ? AND deletedAt IS NULL")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(hash.flatten())
+    }
+
+    async fn document(&self, row: Option<UserRow>) -> Result<Option<UserDocument>, DbError> {
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let onboarded = user_is_onboarded(&self.pool, &row.id).await?;
+        Ok(Some(row.into_document(onboarded)))
+    }
 }
 
 const SESSION_USER_SQL: &str = "SELECT
@@ -413,6 +470,7 @@ pub enum DbError {
     NotFound,
     Validation,
     Quota,
+    BadRequest(&'static str),
     Database(sqlx::Error),
     Store(String),
 }
@@ -1071,33 +1129,33 @@ async fn ensure_admin_onboarding(pool: &SqlitePool) -> Result<(), StartupError> 
     Ok(())
 }
 
+const USER_DOCUMENT_SQL: &str = "SELECT
+    id, email, password, name,
+    profileImagePath AS profile_image_path,
+    avatarColor AS avatar_color,
+    profileChangedAt AS profile_changed_at,
+    clusterGroupId AS cluster_group_id,
+    storageLabel AS storage_label,
+    shouldChangePassword AS should_change_password,
+    isAdmin AS is_admin,
+    createdAt AS created_at,
+    deletedAt AS deleted_at,
+    updatedAt AS updated_at,
+    oauthId AS oauth_id,
+    quotaSizeInBytes AS quota_size_in_bytes,
+    quotaUsageInBytes AS quota_usage_in_bytes,
+    status
+ FROM user";
+
 async fn find_active_user_by_email(
     pool: &SqlitePool,
     email: &str,
 ) -> Result<Option<UserRow>, sqlx::Error> {
-    sqlx::query_as::<_, UserRow>(
-        "SELECT
-            id, email, password, name,
-            profileImagePath AS profile_image_path,
-            avatarColor AS avatar_color,
-            profileChangedAt AS profile_changed_at,
-            clusterGroupId AS cluster_group_id,
-            storageLabel AS storage_label,
-            shouldChangePassword AS should_change_password,
-            isAdmin AS is_admin,
-            createdAt AS created_at,
-            deletedAt AS deleted_at,
-            updatedAt AS updated_at,
-            oauthId AS oauth_id,
-            quotaSizeInBytes AS quota_size_in_bytes,
-            quotaUsageInBytes AS quota_usage_in_bytes,
-            status
-         FROM user
-         WHERE email = ? AND deletedAt IS NULL",
-    )
-    .bind(email)
-    .fetch_optional(pool)
-    .await
+    let sql = format!("{USER_DOCUMENT_SQL} WHERE email = ? AND deletedAt IS NULL");
+    sqlx::query_as::<_, UserRow>(&sql)
+        .bind(email)
+        .fetch_optional(pool)
+        .await
 }
 
 async fn user_is_onboarded(pool: &SqlitePool, user_id: &str) -> Result<bool, sqlx::Error> {
