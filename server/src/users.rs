@@ -795,6 +795,12 @@ impl App {
             remove_local_file(self.data_dir(), &path).await;
         }
         remove_local_file(self.data_dir(), profile_path).await;
+        let people = self.data_dir().join("thumbs").join(id);
+        if let Err(error) = tokio::fs::remove_dir_all(&people).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("user delete people: {error}");
+            }
+        }
     }
 }
 

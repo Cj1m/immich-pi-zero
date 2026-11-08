@@ -116,6 +116,99 @@ pub fn remove_thumbs(data_dir: &Path, asset_id: &str) {
     let _ = std::fs::remove_dir_all(data_dir.join("thumbs").join(asset_id));
 }
 
+pub(crate) struct FaceCrop {
+    pub width: i64,
+    pub height: i64,
+    pub x1: i64,
+    pub y1: i64,
+    pub x2: i64,
+    pub y2: i64,
+}
+
+/// The file `PersonGenerateThumbnail` would write: a 250-edge JPEG cropped from the featured face.
+/// There is no job queue, so the request writes it before it returns.
+pub(crate) fn write_person_jpeg(
+    data_dir: &Path,
+    owner_id: &str,
+    person_id: &str,
+    source: &Path,
+    crop: FaceCrop,
+) -> Option<std::path::PathBuf> {
+    if person_id.len() < 4 || crop.width <= 0 || crop.height <= 0 {
+        return None;
+    }
+    let image = image::ImageReader::open(source)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    let (x, y, edge) = face_square(&image, &crop)?;
+    let face = image
+        .crop_imm(x, y, edge, edge)
+        .thumbnail(THUMB_EDGE, THUMB_EDGE);
+    let (prefix, rest) = person_id.split_at(2);
+    let (next, _) = rest.split_at(2);
+    let directory = data_dir
+        .join("thumbs")
+        .join(owner_id)
+        .join(prefix)
+        .join(next);
+    std::fs::create_dir_all(&directory).ok()?;
+    let path = directory.join(format!("{person_id}.jpeg"));
+    write_jpeg(&face, &path)?;
+    Some(path)
+}
+
+/// Same square as v3.3.6 `getCrop`: clamp the box, scale it onto the decoded image, then zoom out 10%.
+fn face_square(image: &image::DynamicImage, crop: &FaceCrop) -> Option<(u32, u32, u32)> {
+    let old_w = crop.width as f64;
+    let old_h = crop.height as f64;
+    let new_w = f64::from(image.width());
+    let new_h = f64::from(image.height());
+    if new_w < 2.0 || new_h < 2.0 {
+        return None;
+    }
+    let x1 = (crop.x1.clamp(0, crop.width) as f64).min(old_w);
+    let y1 = (crop.y1.clamp(0, crop.height) as f64).min(old_h);
+    let x2 = (crop.x2.clamp(0, crop.width) as f64).min(old_w);
+    let y2 = (crop.y2.clamp(0, crop.height) as f64).min(old_h);
+    let width_scale = new_w / old_w;
+    let height_scale = new_h / old_h;
+    let half_w = width_scale * (x2 - x1) / 2.0;
+    let half_h = height_scale * (y2 - y1) / 2.0;
+    if half_w <= 0.0 && half_h <= 0.0 {
+        return None;
+    }
+    let middle_x = (width_scale * x1 + half_w).round();
+    let middle_y = (height_scale * y1 + half_h).round();
+    let target = (half_w.max(half_h) * 1.1).floor();
+    let new_half = [
+        middle_x - (middle_x - target).max(0.0),
+        middle_y - (middle_y - target).max(0.0),
+        (new_w - 1.0).min(middle_x + target) - middle_x,
+        (new_h - 1.0).min(middle_y + target) - middle_y,
+    ]
+    .into_iter()
+    .fold(f64::INFINITY, f64::min);
+    if new_half < 1.0 {
+        return None;
+    }
+    let mut x = (middle_x - new_half).round().max(0.0) as u32;
+    let mut y = (middle_y - new_half).round().max(0.0) as u32;
+    let mut edge = (new_half * 2.0).round().max(1.0) as u32;
+    if x >= image.width() || y >= image.height() {
+        return None;
+    }
+    edge = edge.min(image.width() - x).min(image.height() - y);
+    if edge == 0 {
+        return None;
+    }
+    x = x.min(image.width() - edge);
+    y = y.min(image.height() - edge);
+    Some((x, y, edge))
+}
+
 pub(crate) enum ProfileJpeg {
     Wrote(std::path::PathBuf),
     Undecodable,

@@ -634,3 +634,496 @@ async fn people_list_search_and_shares() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+async fn sign_in(app: &App, email: &str, password: &str) -> (String, String) {
+    let response = immich_server::router(app.clone())
+        .oneshot(json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(&format!(r#"{{"email":"{email}","password":"{password}"}}"#)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let cookie = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("immich_access_token="))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let login: Value = serde_json::from_slice(&bytes).unwrap();
+    (cookie, login["userId"].as_str().unwrap().to_string())
+}
+
+async fn add_person(
+    app: &App,
+    owner: &str,
+    asset: &str,
+    name: &str,
+    birth: Option<&str>,
+    faces: i64,
+    thumb: Option<&str>,
+) -> (String, Vec<String>) {
+    let person_id = uuid::Uuid::new_v4().to_string();
+    let now = "2020-01-02T03:04:05.000Z";
+    let update_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO person_group (id, clusterGroupId, createdAt, createId, updatedAt, updateId)
+         VALUES (?, NULL, ?, ?, ?, ?)",
+    )
+    .bind(&person_id)
+    .bind(now)
+    .bind(&update_id)
+    .bind(now)
+    .bind(&update_id)
+    .execute(app.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO person
+            (ownerId, personGroupId, createdAt, updatedAt, name, thumbnailPath, isHidden, birthDate,
+             faceAssetId, isFavorite, color, updateId)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, 0, NULL, ?)",
+    )
+    .bind(owner)
+    .bind(&person_id)
+    .bind(now)
+    .bind(now)
+    .bind(name)
+    .bind(thumb.unwrap_or(""))
+    .bind(birth)
+    .bind(uuid::Uuid::now_v7().to_string())
+    .execute(app.pool())
+    .await
+    .unwrap();
+    let mut face_ids = Vec::new();
+    for index in 0..faces {
+        let face_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO asset_face
+                (id, assetId, personGroupId, imageWidth, imageHeight, boundingBoxX1, boundingBoxY1,
+                 boundingBoxX2, boundingBoxY2, sourceType, deletedAt, updatedAt, updateId, isVisible,
+                 ownerId, assetVisibility, assetDeletedAt)
+             VALUES (?, ?, ?, 80, 60, ?, 6, ?, 36, 'machine-learning', NULL, ?, ?, 1, ?, 'timeline', NULL)",
+        )
+        .bind(&face_id)
+        .bind(asset)
+        .bind(&person_id)
+        .bind(8 + index * 4)
+        .bind(40 + index * 4)
+        .bind(now)
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(owner)
+        .execute(app.pool())
+        .await
+        .unwrap();
+        face_ids.push(face_id);
+    }
+    (person_id, face_ids)
+}
+
+async fn add_copy(app: &App, owner: &str, person_id: &str, name: &str, birth: Option<&str>) {
+    let now = "2020-01-02T03:04:05.000Z";
+    sqlx::query(
+        "INSERT INTO person
+            (ownerId, personGroupId, createdAt, updatedAt, name, thumbnailPath, isHidden, birthDate,
+             faceAssetId, isFavorite, color, updateId)
+         VALUES (?, ?, ?, ?, ?, '', 0, ?, NULL, 0, NULL, ?)",
+    )
+    .bind(owner)
+    .bind(person_id)
+    .bind(now)
+    .bind(now)
+    .bind(name)
+    .bind(birth)
+    .bind(uuid::Uuid::now_v7().to_string())
+    .execute(app.pool())
+    .await
+    .unwrap();
+}
+
+fn sync_lines(body: &[u8]) -> Vec<Value> {
+    String::from_utf8(body.to_vec())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn merge_reassign_and_delete_a_face() {
+    let dir = std::env::temp_dir().join(format!("immich-faces-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let app = App::prepare(&config(&dir)).await.expect("prepare");
+    let (cookie, user_id) = sign_in(&app, "admin@example.com", "correct horse").await;
+
+    let image = {
+        let picture = image::RgbImage::from_pixel(80, 60, image::Rgb([210, 40, 20]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(picture)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Jpeg)
+            .unwrap();
+        bytes
+    };
+    let (status, body) = call(&app, upload(&cookie, &image)).await;
+    let uploaded: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 201, "{uploaded}");
+    let asset_id = uploaded["id"].as_str().unwrap().to_string();
+
+    let (status, body) = call(&app, json_request("POST", "/api/people", None, Some("{}"))).await;
+    let unsigned: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 401, "{unsigned}");
+    assert_eq!(unsigned["message"], "Authentication required");
+
+    let (status, body) = call(
+        &app,
+        json_request("POST", "/api/people", Some(&cookie), Some("{}")),
+    )
+    .await;
+    let created: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["name"], "");
+    assert_eq!(created["isHidden"], false);
+    assert_eq!(created["isFavorite"], false);
+    assert_eq!(created["thumbnailPath"], "");
+    let fresh = created["id"].as_str().unwrap().to_string();
+
+    let thumb = dir.join("bob-face.jpeg");
+    std::fs::write(&thumb, &image).unwrap();
+    let (ada, _) = add_person(&app, &user_id, &asset_id, "Ada", None, 2, None).await;
+    let (bob, bob_faces) = add_person(
+        &app,
+        &user_id,
+        &asset_id,
+        "Bob",
+        Some("1900-01-01"),
+        2,
+        Some(thumb.to_str().unwrap()),
+    )
+    .await;
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/users",
+            Some(&cookie),
+            Some(r#"{"email":"guest@example.com","password":"temp-pass","name":"Guest"}"#),
+        ),
+    )
+    .await;
+    let guest: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 201, "{guest}");
+    let guest_id = guest["id"].as_str().unwrap();
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/users",
+            Some(&cookie),
+            Some(r#"{"email":"mover@example.com","password":"temp-pass","name":"Mover"}"#),
+        ),
+    )
+    .await;
+    let mover: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 201, "{mover}");
+    let mover_id = mover["id"].as_str().unwrap();
+    add_copy(&app, guest_id, &ada, "Guest Ada", Some("1900-01-01")).await;
+    add_copy(&app, guest_id, &bob, "Guest Bob", Some("1900-01-01")).await;
+    add_copy(&app, mover_id, &bob, "", None).await;
+
+    let (guest_cookie, _) = sign_in(&app, "guest@example.com", "temp-pass").await;
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/people/merge",
+            Some(&guest_cookie),
+            Some(
+                r#"{"ids":["00000000-0000-4000-8000-000000000001","00000000-0000-4000-8000-000000000002"]}"#,
+            ),
+        ),
+    )
+    .await;
+    let denied: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 200, "{denied}");
+    assert_eq!(denied[0]["success"], false);
+    assert_eq!(denied[0]["error"], "no_permission");
+    assert_eq!(denied[1]["error"], "no_permission");
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/people/merge",
+            Some(&cookie),
+            Some(&format!(r#"{{"ids":["{ada}"]}}"#)),
+        ),
+    )
+    .await;
+    let short: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 400, "{short}");
+    assert_eq!(
+        short["message"],
+        "At least two people are required for merging"
+    );
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/people/merge",
+            Some(&cookie),
+            Some(&format!(r#"{{"ids":["{ada}","{ada}"]}}"#)),
+        ),
+    )
+    .await;
+    let repeated: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 400, "{repeated}");
+    assert_eq!(repeated["message"], "Cannot merge a person into themselves");
+
+    let unknown = "00000000-0000-4000-8000-000000000099";
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/people/merge",
+            Some(&cookie),
+            Some(&format!(r#"{{"ids":["{unknown}","{ada}"]}}"#)),
+        ),
+    )
+    .await;
+    let skipped: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 200, "{skipped}");
+    assert_eq!(skipped[0]["id"], unknown);
+    assert_eq!(skipped[0]["error"], "no_permission");
+    assert_eq!(skipped[1]["id"], ada);
+    assert_eq!(skipped[1]["success"], true);
+    assert!(skipped[1].get("error").is_none());
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/people/merge",
+            Some(&cookie),
+            Some(&format!(r#"{{"ids":["{ada}","{bob}"]}}"#)),
+        ),
+    )
+    .await;
+    let merged: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 200, "{merged}");
+    assert_eq!(merged[0]["id"], ada);
+    assert_eq!(merged[0]["success"], true);
+    assert_eq!(merged[1]["id"], bob);
+    assert_eq!(merged[1]["success"], true);
+    assert!(merged[1].get("error").is_none());
+    assert!(!thumb.exists());
+
+    let (status, body) = call(
+        &app,
+        json_request("GET", &format!("/api/people/{ada}"), Some(&cookie), None),
+    )
+    .await;
+    let kept: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 200, "{kept}");
+    assert_eq!(kept["name"], "Ada");
+    assert_eq!(kept["birthDate"], "1900-01-01");
+    let bob_faces_left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM asset_face WHERE personGroupId = ? AND ownerId = ?",
+    )
+    .bind(&bob)
+    .bind(&user_id)
+    .fetch_one(app.pool())
+    .await
+    .unwrap();
+    assert_eq!(bob_faces_left, 0);
+    let guest_bob: String =
+        sqlx::query_scalar("SELECT name FROM person WHERE ownerId = ? AND personGroupId = ?")
+            .bind(guest_id)
+            .bind(&bob)
+            .fetch_one(app.pool())
+            .await
+            .unwrap();
+    assert_eq!(guest_bob, "Guest Bob");
+    let mover_group: String =
+        sqlx::query_scalar("SELECT personGroupId FROM person WHERE ownerId = ?")
+            .bind(mover_id)
+            .fetch_one(app.pool())
+            .await
+            .unwrap();
+    assert_eq!(mover_group, ada);
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/sync/stream",
+            Some(&cookie),
+            Some(r#"{"types":["PeopleV1","AssetFacesV3"]}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let lines = sync_lines(&body);
+    assert!(lines
+        .iter()
+        .any(|line| { line["type"] == "PersonDeleteV1" && line["data"]["personId"] == bob }));
+    assert!(lines.iter().any(|line| {
+        line["type"] == "AssetFaceV3"
+            && line["data"]["id"] == bob_faces[0]
+            && line["data"]["personId"] == ada
+    }));
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/people/{fresh}/reassign"),
+            Some(&cookie),
+            Some(&format!(
+                r#"{{"data":[{{"assetId":"{asset_id}","personId":"{ada}"}}]}}"#
+            )),
+        ),
+    )
+    .await;
+    let moved: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 200, "{moved}");
+    assert_eq!(moved.as_array().unwrap().len(), 1);
+    assert_eq!(moved[0]["id"], fresh);
+    let (status, body) = call(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/people/{fresh}/thumbnail"),
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(&body[..2], &[0xFF, 0xD8]);
+
+    let missing = "00000000-0000-4000-8000-000000000077";
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/people/{missing}/reassign"),
+            Some(&cookie),
+            Some(r#"{"data":[]}"#),
+        ),
+    )
+    .await;
+    let absent: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 400, "{absent}");
+    assert_eq!(absent["message"], "Person not found");
+
+    let face_id: String = sqlx::query_scalar(
+        "SELECT id FROM asset_face WHERE personGroupId = ? AND ownerId = ? ORDER BY id LIMIT 1",
+    )
+    .bind(&fresh)
+    .bind(&user_id)
+    .fetch_one(app.pool())
+    .await
+    .unwrap();
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/faces/{ada}"),
+            Some(&cookie),
+            Some(&format!(r#"{{"id":"{face_id}"}}"#)),
+        ),
+    )
+    .await;
+    let one: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 200, "{one}");
+    assert_eq!(one["id"], ada);
+    let home: String = sqlx::query_scalar("SELECT personGroupId FROM asset_face WHERE id = ?")
+        .bind(&face_id)
+        .fetch_one(app.pool())
+        .await
+        .unwrap();
+    assert_eq!(home, ada);
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/faces/{ada}"),
+            Some(&cookie),
+            Some(&format!(r#"{{"id":"{missing}"}}"#)),
+        ),
+    )
+    .await;
+    let no_face: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 400, "{no_face}");
+    assert_eq!(no_face["message"], "Not found or no person.create access");
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/faces/{face_id}"),
+            Some(&cookie),
+            Some(r#"{"force":false}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 204, "{}", String::from_utf8_lossy(&body));
+    assert!(body.is_empty());
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/sync/stream",
+            Some(&cookie),
+            Some(r#"{"types":["AssetFacesV3"]}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let lines = sync_lines(&body);
+    let deleted = lines
+        .iter()
+        .find(|line| line["type"] == "AssetFaceV3" && line["data"]["id"] == face_id)
+        .unwrap();
+    assert!(deleted["data"]["deletedAt"].as_str().is_some());
+
+    let (status, body) = call(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/faces/{face_id}"),
+            Some(&cookie),
+            Some(r#"{"force":true}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 204, "{}", String::from_utf8_lossy(&body));
+    let (status, body) = call(
+        &app,
+        json_request(
+            "POST",
+            "/api/sync/stream",
+            Some(&cookie),
+            Some(r#"{"types":["AssetFacesV3"]}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let lines = sync_lines(&body);
+    assert!(lines.iter().any(|line| {
+        line["type"] == "AssetFaceDeleteV1" && line["data"]["assetFaceId"] == face_id
+    }));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

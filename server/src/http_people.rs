@@ -3,7 +3,7 @@
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post, put};
 use axum::Router;
 use serde_json::Value;
 
@@ -14,17 +14,20 @@ use crate::people::{PeopleError, PeopleQuery, PeopleUserQuery};
 
 pub(crate) fn routes() -> Router<App> {
     Router::new()
-        .route("/api/people", get(list_people))
+        .route("/api/people", get(list_people).post(create_person))
+        .route("/api/people/merge", post(merge_people))
         .route(
             "/api/people/users",
             get(list_users).put(upsert_users).delete(remove_users),
         )
+        .route("/api/people/{id}/reassign", put(reassign_faces))
         .route("/api/people/{id}/statistics", get(statistics))
         .route("/api/people/{id}/thumbnail", get(thumbnail))
         .route(
             "/api/people/{id}",
             get(person).put(update_person).patch(update_person),
         )
+        .route("/api/faces/{id}", put(reassign_face).delete(delete_face))
         .route("/api/search/person", get(search_person))
 }
 
@@ -175,6 +178,108 @@ async fn update_person(
     };
     match app.update_person(&user_id, &id, &body).await {
         Ok(body) => json_ok(body),
+        Err(error) => people_error(error),
+    }
+}
+
+async fn create_person(State(app): State<App>, request: Request) -> Response {
+    let headers = request.headers().clone();
+    let raw_query = request.uri().query().unwrap_or("").to_string();
+    let user_id = match viewer(&app, &headers, &share_from_query(&raw_query)).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let body = match json_body(request).await {
+        Ok(body) => body,
+        Err(text) => return message(StatusCode::BAD_REQUEST, text),
+    };
+    match app.create_person(&user_id, &body).await {
+        Ok(body) => (StatusCode::CREATED, axum::Json(body)).into_response(),
+        Err(error) => people_error(error),
+    }
+}
+
+async fn merge_people(State(app): State<App>, request: Request) -> Response {
+    let headers = request.headers().clone();
+    let raw_query = request.uri().query().unwrap_or("").to_string();
+    let user_id = match viewer(&app, &headers, &share_from_query(&raw_query)).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let body = match json_body(request).await {
+        Ok(body) => body,
+        Err(text) => return message(StatusCode::BAD_REQUEST, text),
+    };
+    match app.merge_people(&user_id, &body).await {
+        Ok(body) => json_ok(body),
+        Err(error) => people_error(error),
+    }
+}
+
+async fn reassign_faces(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Response {
+    let headers = request.headers().clone();
+    let raw_query = request.uri().query().unwrap_or("").to_string();
+    if uuid::Uuid::parse_str(&id).is_err() {
+        return message(StatusCode::BAD_REQUEST, "Validation failed");
+    }
+    let user_id = match viewer(&app, &headers, &share_from_query(&raw_query)).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let body = match json_body(request).await {
+        Ok(body) => body,
+        Err(text) => return message(StatusCode::BAD_REQUEST, text),
+    };
+    match app.reassign_faces(&user_id, &id, &body).await {
+        Ok(body) => json_ok(body),
+        Err(error) => people_error(error),
+    }
+}
+
+async fn reassign_face(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Response {
+    let headers = request.headers().clone();
+    let raw_query = request.uri().query().unwrap_or("").to_string();
+    if uuid::Uuid::parse_str(&id).is_err() {
+        return message(StatusCode::BAD_REQUEST, "Validation failed");
+    }
+    let user_id = match viewer(&app, &headers, &share_from_query(&raw_query)).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let body = match json_body(request).await {
+        Ok(body) => body,
+        Err(text) => return message(StatusCode::BAD_REQUEST, text),
+    };
+    match app.reassign_face(&user_id, &id, &body).await {
+        Ok(body) => json_ok(body),
+        Err(error) => people_error(error),
+    }
+}
+
+async fn delete_face(State(app): State<App>, Path(id): Path<String>, request: Request) -> Response {
+    let headers = request.headers().clone();
+    let raw_query = request.uri().query().unwrap_or("").to_string();
+    if uuid::Uuid::parse_str(&id).is_err() {
+        return message(StatusCode::BAD_REQUEST, "Validation failed");
+    }
+    let user_id = match viewer(&app, &headers, &share_from_query(&raw_query)).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let body = match json_body(request).await {
+        Ok(body) => body,
+        Err(text) => return message(StatusCode::BAD_REQUEST, text),
+    };
+    match app.delete_face(&user_id, &id, &body).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => people_error(error),
     }
 }
