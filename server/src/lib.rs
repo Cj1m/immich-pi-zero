@@ -13,6 +13,7 @@ mod browse;
 mod config;
 mod db;
 mod duplicates;
+mod edits;
 mod exif_meta;
 mod http;
 mod http_account;

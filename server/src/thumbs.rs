@@ -116,6 +116,84 @@ pub fn remove_thumbs(data_dir: &Path, asset_id: &str) {
     let _ = std::fs::remove_dir_all(data_dir.join("thumbs").join(asset_id));
 }
 
+pub(crate) enum StillEdit {
+    Crop { x: u32, y: u32, width: u32, height: u32 },
+    Rotate(u32),
+    MirrorHorizontal,
+    MirrorVertical,
+}
+
+pub(crate) fn oriented_size(source: &Path, orientation: Option<u16>) -> Option<(i64, i64)> {
+    let image = decode_oriented(source, orientation)?;
+    Some((i64::from(image.width()), i64::from(image.height())))
+}
+
+pub(crate) fn remove_edited_stills(data_dir: &Path, asset_id: &str) {
+    let directory = data_dir.join("thumbs").join(asset_id);
+    let _ = std::fs::remove_file(directory.join("thumbnail_edited.jpg"));
+    let _ = std::fs::remove_file(directory.join("preview_edited.jpg"));
+}
+
+/// Orientation first, then each edit. The size is the full edited image, before the preview shrinks.
+pub(crate) fn write_edited_stills(
+    data_dir: &Path,
+    asset_id: &str,
+    source: &Path,
+    orientation: Option<u16>,
+    steps: &[StillEdit],
+) -> Option<(i64, i64)> {
+    let mut image = decode_oriented(source, orientation)?;
+    for step in steps {
+        image = apply_still(image, step)?;
+    }
+    let width = i64::from(image.width());
+    let height = i64::from(image.height());
+    let directory = data_dir.join("thumbs").join(asset_id);
+    std::fs::create_dir_all(&directory).ok()?;
+    let thumbnail = if image.width() <= THUMB_EDGE && image.height() <= THUMB_EDGE {
+        image.clone()
+    } else {
+        image.thumbnail(THUMB_EDGE, THUMB_EDGE)
+    };
+    write_jpeg(&thumbnail, &directory.join("thumbnail_edited.jpg"))?;
+    let preview = if image.width() <= PREVIEW_EDGE && image.height() <= PREVIEW_EDGE {
+        image
+    } else {
+        image.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE)
+    };
+    write_jpeg(&preview, &directory.join("preview_edited.jpg"))?;
+    Some((width, height))
+}
+
+fn decode_oriented(source: &Path, orientation: Option<u16>) -> Option<image::DynamicImage> {
+    let image = image::ImageReader::open(source)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    Some(apply_orientation(image, orientation))
+}
+
+fn apply_still(image: image::DynamicImage, step: &StillEdit) -> Option<image::DynamicImage> {
+    match step {
+        StillEdit::Crop { x, y, width, height } => {
+            if x.saturating_add(*width) > image.width() || y.saturating_add(*height) > image.height()
+            {
+                return None;
+            }
+            Some(image.crop_imm(*x, *y, *width, *height))
+        }
+        StillEdit::Rotate(0) => Some(image),
+        StillEdit::Rotate(90) => Some(image.rotate90()),
+        StillEdit::Rotate(180) => Some(image.rotate180()),
+        StillEdit::Rotate(270) => Some(image.rotate270()),
+        StillEdit::Rotate(_) => None,
+        StillEdit::MirrorHorizontal => Some(image.flipv()),
+        StillEdit::MirrorVertical => Some(image.fliph()),
+    }
+}
+
 pub(crate) struct FaceCrop {
     pub width: i64,
     pub height: i64,

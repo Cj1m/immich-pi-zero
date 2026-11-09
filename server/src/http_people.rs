@@ -27,7 +27,7 @@ pub(crate) fn routes() -> Router<App> {
             "/api/people/{id}",
             get(person).put(update_person).patch(update_person),
         )
-        .route("/api/faces", get(asset_faces))
+        .route("/api/faces", get(asset_faces).post(create_face))
         .route("/api/faces/{id}", put(reassign_face).delete(delete_face))
         .route("/api/search/person", get(search_person))
 }
@@ -57,6 +57,27 @@ async fn asset_faces(State(app): State<App>, request: Request) -> Response {
     match app.asset_faces(&id, &caller).await {
         Ok(body) => json_ok(body),
         Err(error) => db_error(error),
+    }
+}
+
+async fn create_face(State(app): State<App>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let query = parts.uri.query().unwrap_or("");
+    let caller = match crate::http_duplicates::signed_in(&app, &parts.headers, query).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return message(StatusCode::BAD_REQUEST, "Validation failed"),
+    };
+    let value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) if value.is_object() => value,
+        _ => return message(StatusCode::BAD_REQUEST, "Validation failed"),
+    };
+    match app.create_manual_face(&caller, &value).await {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(error) => people_error(error),
     }
 }
 

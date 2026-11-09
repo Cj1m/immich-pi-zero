@@ -36,6 +36,10 @@ pub fn routes() -> Router<App> {
         .route("/api/assets/{id}/original", get(download_original))
         .route("/api/assets/{id}/thumbnail", get(download_thumbnail))
         .route("/api/assets/{id}/ocr", get(asset_ocr))
+        .route(
+            "/api/assets/{id}/edits",
+            get(asset_edits).put(replace_edits).delete(clear_edits),
+        )
         .route("/api/sync/stream", post(sync_stream))
         .route(
             "/api/sync/ack",
@@ -330,6 +334,55 @@ async fn get_asset(
     }
 }
 
+async fn asset_edits(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Response {
+    let headers = request.headers().clone();
+    let query = request.uri().query().unwrap_or("");
+    let caller = match signed_in(&app, &headers, query).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    match app.read_asset_edits(&caller, &id).await {
+        Ok(body) => json_ok(body),
+        Err(error) => db_error(error),
+    }
+}
+
+async fn replace_edits(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Response {
+    let (caller, body) = match signed_json(&app, request).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match app.replace_asset_edits(&caller, &id, &body).await {
+        Ok(body) => json_ok(body),
+        Err(error) => db_error(error),
+    }
+}
+
+async fn clear_edits(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Response {
+    let headers = request.headers().clone();
+    let query = request.uri().query().unwrap_or("");
+    let caller = match signed_in(&app, &headers, query).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    match app.clear_asset_edits(&caller, &id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => db_error(error),
+    }
+}
+
 async fn asset_ocr(State(app): State<App>, Path(id): Path<String>, request: Request) -> Response {
     let headers = request.headers().clone();
     let query = request.uri().query().unwrap_or("");
@@ -515,11 +568,12 @@ async fn download_thumbnail(
         .size
         .clone()
         .unwrap_or_else(|| "thumbnail".to_string());
+    let edited = matches!(query.edited.as_deref(), Some("true") | Some("1"));
     let range = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok());
     match app
-        .thumbnail_response(user_id(&auth), &id, &size, range)
+        .thumbnail_response(user_id(&auth), &id, &size, edited, range)
         .await
     {
         Ok(response) => response,

@@ -910,6 +910,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 19 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V19.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (19)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -1537,6 +1555,27 @@ CREATE TABLE asset_ocr (
     updateId TEXT NOT NULL
 );
 CREATE INDEX asset_ocr_asset ON asset_ocr(assetId);
+";
+
+const SCHEMA_V19: &str = "
+CREATE TABLE asset_edit (
+    id TEXT PRIMARY KEY NOT NULL,
+    assetId TEXT NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+    action TEXT NOT NULL,
+    parameters TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    updatedAt TEXT NOT NULL,
+    updateId TEXT NOT NULL,
+    UNIQUE(assetId, sequence)
+);
+CREATE INDEX asset_edit_update ON asset_edit(updateId);
+CREATE TABLE asset_edit_audit (
+    id TEXT PRIMARY KEY NOT NULL,
+    editId TEXT NOT NULL,
+    assetId TEXT NOT NULL,
+    deletedAt TEXT NOT NULL
+);
+CREATE INDEX asset_edit_audit_id ON asset_edit_audit(id);
 ";
 
 struct LiveSocket {

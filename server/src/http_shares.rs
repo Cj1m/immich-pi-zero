@@ -42,6 +42,7 @@ pub(crate) struct ShareQuery {
     #[serde(rename = "orderBy")]
     pub order_by: Option<String>,
     pub bbox: Option<String>,
+    pub edited: Option<String>,
     pub size: Option<String>,
 }
 

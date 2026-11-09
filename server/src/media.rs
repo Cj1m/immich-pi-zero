@@ -323,6 +323,15 @@ impl App {
         record.ok_or(DbError::NotFound)
     }
 
+    pub(crate) async fn asset_by_id(&self, id: &str) -> Result<Option<AssetRecord>, DbError> {
+        let sql = format!("{ASSET_SQL} WHERE asset.id = ?");
+        let record = sqlx::query_as::<_, AssetRecord>(&sql)
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(record)
+    }
+
     pub(crate) async fn changed_assets(
         &self,
         owner_id: &str,
@@ -400,7 +409,7 @@ impl App {
         let mut value = asset_json(record, stack);
         value["tags"] = self.asset_tag_documents(&record.id).await?;
         value["people"] = self.asset_people(&record.id, &record.owner_id).await?;
-        value["edits"] = json!([]);
+        value["edits"] = self.edit_documents(&record.id).await?;
         value["owner"] = self.owner_brief(&record.owner_id).await?;
         Ok(value)
     }
@@ -757,6 +766,7 @@ impl App {
         owner_id: &str,
         id: &str,
         size: &str,
+        edited: bool,
         range_header: Option<&str>,
     ) -> Result<axum::response::Response, DbError> {
         let record = self.asset_record(owner_id, id).await?;
@@ -765,13 +775,15 @@ impl App {
         } else {
             "thumbnail"
         };
-        let relative: Option<String> =
-            sqlx::query_scalar("SELECT path FROM asset_file WHERE assetId = ? AND type = ?")
-                .bind(&record.id)
-                .bind(file_type)
-                .fetch_optional(self.pool())
-                .await?;
-        let relative = if let Some(path) = relative {
+        let edited_path = if edited {
+            self.thumb_file(&record.id, &format!("{file_type}-edited"))
+                .await?
+        } else {
+            None
+        };
+        let relative = if let Some(path) = edited_path {
+            path
+        } else if let Some(path) = self.thumb_file(&record.id, file_type).await? {
             path
         } else {
             let source = self.data_dir().join("objects").join(&record.original_path);
@@ -795,6 +807,16 @@ impl App {
             .await
             .map_err(|_| DbError::NotFound)?;
         Ok(jpeg_response(bytes, range_header))
+    }
+
+    async fn thumb_file(&self, asset_id: &str, kind: &str) -> Result<Option<String>, DbError> {
+        let path: Option<String> =
+            sqlx::query_scalar("SELECT path FROM asset_file WHERE assetId = ? AND type = ?")
+                .bind(asset_id)
+                .bind(kind)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(path.filter(|relative| self.data_dir().join(relative).is_file()))
     }
 
     async fn store_thumb_rows(&self, asset_id: &str, thumbs: &ThumbFiles) -> Result<(), DbError> {

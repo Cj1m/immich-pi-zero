@@ -1242,6 +1242,186 @@ impl App {
         .await?;
         Ok(row)
     }
+
+    pub(crate) async fn create_manual_face(
+        &self,
+        caller: &str,
+        body: &Value,
+    ) -> Result<(), PeopleError> {
+        let asset_id = required_uuid(body, "assetId")?;
+        let person_id = required_uuid(body, "personId")?;
+        let image_width = required_int(body, "imageWidth", 1)?;
+        let image_height = required_int(body, "imageHeight", 1)?;
+        let x = required_int(body, "x", 0)?;
+        let y = required_int(body, "y", 0)?;
+        let width = required_int(body, "width", 1)?;
+        let height = required_int(body, "height", 1)?;
+        let asset: Option<FaceTarget> = sqlx::query_as(
+            "SELECT asset.ownerId AS owner_id, asset.visibility AS visibility,
+                    asset.width AS width, asset.height AS height, asset.deletedAt AS deleted_at,
+                    asset_exif.exifImageWidth AS exif_width,
+                    asset_exif.exifImageHeight AS exif_height,
+                    asset_exif.orientation AS orientation
+             FROM asset
+             LEFT JOIN asset_exif ON asset_exif.assetId = asset.id
+             WHERE asset.id = ?",
+        )
+        .bind(&asset_id)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(asset) = asset else {
+            return Err(PeopleError::Status(StatusCode::NOT_FOUND, "Asset not found"));
+        };
+        if asset.owner_id != caller || asset.visibility == "locked" {
+            return Err(PeopleError::Status(
+                StatusCode::BAD_REQUEST,
+                "Not found or no asset.update access",
+            ));
+        }
+        let owners: Vec<String> =
+            sqlx::query_scalar("SELECT ownerId FROM person WHERE personGroupId = ?")
+                .bind(&person_id)
+                .fetch_all(self.pool())
+                .await?;
+        if owners.is_empty() {
+            return Err(PeopleError::Status(
+                StatusCode::BAD_REQUEST,
+                "Person not found",
+            ));
+        }
+        if owners.iter().all(|owner| owner != caller) {
+            return Err(PeopleError::Status(
+                StatusCode::BAD_REQUEST,
+                "Not found or no person.read access",
+            ));
+        }
+        let edits = self.edit_actions(&asset_id).await?;
+        let (x1, y1, x2, y2, stored_width, stored_height) = if edits.is_empty() {
+            let x2 = x.checked_add(width).ok_or(invalid_face())?;
+            let y2 = y.checked_add(height).ok_or(invalid_face())?;
+            (x, y, x2, y2, image_width, image_height)
+        } else {
+            let asset_width = positive(asset.width)?;
+            let asset_height = positive(asset.height)?;
+            let exif_width = positive(asset.exif_width)?;
+            let exif_height = positive(asset.exif_height)?;
+            let (left, top, right, bottom) = crate::edits::invert_face_box(
+                crate::edits::PreviewBox {
+                    x: x as f64,
+                    y: y as f64,
+                    width: width as f64,
+                    height: height as f64,
+                    image_width: image_width as f64,
+                },
+                &edits,
+                asset_width as f64,
+                asset_height as f64,
+            );
+            let (original_width, original_height) = crate::edits::oriented_bounds(
+                exif_width,
+                exif_height,
+                crate::edits::parse_orientation(asset.orientation.as_deref()),
+            );
+            let left = left.round() as i64;
+            let top = top.round() as i64;
+            let right = right.round() as i64;
+            let bottom = bottom.round() as i64;
+            (
+                left.min(right),
+                top.min(bottom),
+                left.max(right),
+                top.max(bottom),
+                original_width,
+                original_height,
+            )
+        };
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO asset_face (
+                id, assetId, personGroupId, imageWidth, imageHeight, boundingBoxX1, boundingBoxY1,
+                boundingBoxX2, boundingBoxY2, sourceType, deletedAt, updatedAt, updateId, isVisible,
+                ownerId, assetVisibility, assetDeletedAt
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, ?, ?, 1, ?, ?, ?)",
+        )
+        .bind(new_id())
+        .bind(&asset_id)
+        .bind(&person_id)
+        .bind(stored_width)
+        .bind(stored_height)
+        .bind(x1)
+        .bind(y1)
+        .bind(x2)
+        .bind(y2)
+        .bind(&now)
+        .bind(new_update_id())
+        .bind(caller)
+        .bind(&asset.visibility)
+        .bind(&asset.deleted_at)
+        .execute(self.pool())
+        .await?;
+        let thumb: Option<(Option<String>, String)> = sqlx::query_as(
+            "SELECT faceAssetId, thumbnailPath FROM person WHERE ownerId = ? AND personGroupId = ?",
+        )
+        .bind(caller)
+        .bind(&person_id)
+        .fetch_optional(self.pool())
+        .await?;
+        let needs_thumbnail = thumb.is_some_and(|(face, path)| {
+            face.unwrap_or_default().is_empty() || path.is_empty()
+        });
+        if needs_thumbnail {
+            self.refresh_feature_face(caller, &person_id).await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct FaceTarget {
+    owner_id: String,
+    visibility: String,
+    width: Option<i64>,
+    height: Option<i64>,
+    deleted_at: Option<String>,
+    exif_width: Option<i64>,
+    exif_height: Option<i64>,
+    orientation: Option<String>,
+}
+
+fn invalid_face() -> PeopleError {
+    PeopleError::Status(StatusCode::BAD_REQUEST, "Validation failed")
+}
+
+fn dimensions_missing() -> PeopleError {
+    PeopleError::Status(
+        StatusCode::BAD_REQUEST,
+        "Asset does not have valid dimensions",
+    )
+}
+
+fn required_uuid(body: &Value, key: &str) -> Result<String, PeopleError> {
+    let id = body.get(key).and_then(Value::as_str).unwrap_or("");
+    if uuid::Uuid::parse_str(id).is_err() {
+        return Err(invalid_face());
+    }
+    Ok(id.to_string())
+}
+
+fn required_int(body: &Value, key: &str, minimum: i64) -> Result<i64, PeopleError> {
+    let Some(number) = body.get(key).and_then(Value::as_i64) else {
+        return Err(invalid_face());
+    };
+    if number < minimum {
+        return Err(invalid_face());
+    }
+    Ok(number)
+}
+
+fn positive(value: Option<i64>) -> Result<i64, PeopleError> {
+    match value {
+        Some(number) if number > 0 => Ok(number),
+        _ => Err(dimensions_missing()),
+    }
 }
 
 const PEOPLE: &str = "

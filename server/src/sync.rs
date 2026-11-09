@@ -161,6 +161,10 @@ impl App {
                     self.write_faces(&mut body, user_id, &checkpoints, &now_id, true)
                         .await?
                 }
+                "AssetEditsV1" => {
+                    self.write_edit_lines(&mut body, user_id, &checkpoints, &now_id)
+                        .await?
+                }
                 _ => {}
             }
         }
@@ -1047,6 +1051,70 @@ impl App {
             .await?;
         Ok(rows)
     }
+
+    async fn write_edit_lines(
+        &self,
+        body: &mut String,
+        user_id: &str,
+        checkpoints: &HashMap<String, String>,
+        now_id: &str,
+    ) -> Result<(), DbError> {
+        let deletes: Vec<(String, String)> = sqlx::query_as(
+            "SELECT asset_edit_audit.id, asset_edit_audit.editId
+             FROM asset_edit_audit
+             JOIN asset ON asset.id = asset_edit_audit.assetId
+             WHERE asset.ownerId = ?
+               AND asset_edit_audit.id < ?
+               AND (? IS NULL OR asset_edit_audit.id > ?)
+             ORDER BY asset_edit_audit.id",
+        )
+        .bind(user_id)
+        .bind(now_id)
+        .bind(cursor(checkpoints, "AssetEditDeleteV1"))
+        .bind(cursor(checkpoints, "AssetEditDeleteV1"))
+        .fetch_all(self.pool())
+        .await?;
+        for (audit_id, edit_id) in deletes {
+            body.push_str(&sync_line(
+                "AssetEditDeleteV1",
+                json!({ "editId": edit_id }),
+                &audit_id,
+            ));
+        }
+        let rows: Vec<SyncEdit> = sqlx::query_as(
+            "SELECT asset_edit.updateId AS update_id, asset_edit.id AS id,
+                    asset_edit.assetId AS asset_id, asset_edit.action AS action,
+                    asset_edit.parameters AS parameters, asset_edit.sequence AS sequence
+             FROM asset_edit
+             JOIN asset ON asset.id = asset_edit.assetId
+             WHERE asset.ownerId = ?
+               AND (? IS NULL OR asset_edit.updateId > ?)
+               AND asset_edit.updateId < ?
+             ORDER BY asset_edit.updateId",
+        )
+        .bind(user_id)
+        .bind(cursor(checkpoints, "AssetEditV1"))
+        .bind(cursor(checkpoints, "AssetEditV1"))
+        .bind(now_id)
+        .fetch_all(self.pool())
+        .await?;
+        for edit in rows {
+            let parameters: Value =
+                serde_json::from_str(&edit.parameters).map_err(|_| DbError::Validation)?;
+            body.push_str(&sync_line(
+                "AssetEditV1",
+                json!({
+                    "id": edit.id,
+                    "assetId": edit.asset_id,
+                    "action": edit.action,
+                    "parameters": parameters,
+                    "sequence": edit.sequence,
+                }),
+                &edit.update_id,
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -1164,6 +1232,16 @@ struct SyncPerson {
     is_favorite: i64,
     color: Option<String>,
     face_asset_id: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SyncEdit {
+    update_id: String,
+    id: String,
+    asset_id: String,
+    action: String,
+    parameters: String,
+    sequence: i64,
 }
 
 #[derive(sqlx::FromRow)]

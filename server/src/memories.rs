@@ -56,6 +56,9 @@ async fn run_nightly(app: &App) {
         if let Err(error) = app.purge_expired_users().await {
             eprintln!("user delete: {error:?}");
         }
+        if let Err(error) = app.prune_edit_audits().await {
+            eprintln!("edit audit: {error:?}");
+        }
     }
 }
 
