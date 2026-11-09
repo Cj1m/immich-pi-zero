@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use crate::db::{App, ClientDevice, DbError, UserDocument};
 
-const COOKIE_MAX_AGE_SECONDS: u64 = 400 * 24 * 60 * 60;
+pub(crate) const COOKIE_MAX_AGE_SECONDS: u64 = 400 * 24 * 60 * 60;
 
 pub fn router(app: App) -> Router {
     Router::new()
@@ -47,6 +47,7 @@ pub fn router(app: App) -> Router {
         .merge(crate::http_clusters::routes())
         .merge(crate::http_admin::routes())
         .merge(crate::http_libraries::routes())
+        .merge(crate::http_oauth::routes())
         .merge(crate::http_media::routes())
         .merge(crate::http_shares::routes())
         .fallback(crate::web::browser_document)
@@ -106,7 +107,7 @@ async fn login(State(app): State<App>, request: Request) -> Response {
         .login(&credentials.email, &credentials.password, &device)
         .await
     {
-        Ok(success) => login_response(success.token, &success.user, secure),
+        Ok(success) => login_response(success.token, &success.user, secure, "password"),
         Err(error) => db_error(error),
     }
 }
@@ -123,12 +124,25 @@ async fn logout(State(app): State<App>, request: Request) -> Response {
         Ok(session) => session,
         Err(response) => return response,
     };
+    let auth_type = cookie(request.headers(), "immich_auth_type").unwrap_or_default();
+    let bearer = if auth_type == "oauth" {
+        match app.oauth_session_bearer(&session.session_id).await {
+            Ok(bearer) => bearer,
+            Err(error) => return crate::http_oauth::oauth_error(error),
+        }
+    } else {
+        None
+    };
     if let Err(error) = app.logout(&session.session_id).await {
         return db_error(error);
     }
+    let redirect = match app.oauth_logout_redirect(&auth_type, bearer.as_deref()).await {
+        Ok(redirect) => redirect,
+        Err(error) => return crate::http_oauth::oauth_error(error),
+    };
     let mut response = json_ok(json!({
         "successful": true,
-        "redirectUri": "/auth/login?autoLaunch=0",
+        "redirectUri": redirect,
     }));
     let headers = response.headers_mut();
     for cookie in [
@@ -220,7 +234,12 @@ pub(crate) async fn require_session(
     Ok(session)
 }
 
-fn login_response(token: String, user: &UserDocument, secure: bool) -> Response {
+pub(crate) fn login_response(
+    token: String,
+    user: &UserDocument,
+    secure: bool,
+    auth_type: &str,
+) -> Response {
     let mut response = (
         StatusCode::CREATED,
         axum::Json(json!({
@@ -244,7 +263,7 @@ fn login_response(token: String, user: &UserDocument, secure: bool) -> Response 
     );
     append_cookie(
         headers,
-        format!("immich_auth_type=password; {common}; HttpOnly"),
+        format!("immich_auth_type={auth_type}; {common}; HttpOnly"),
     );
     append_cookie(headers, format!("immich_is_authenticated=true; {common}"));
     response
@@ -273,7 +292,7 @@ pub(crate) fn user_json(user: &UserDocument) -> Value {
     })
 }
 
-fn client_device(headers: &HeaderMap) -> ClientDevice {
+pub(crate) fn client_device(headers: &HeaderMap) -> ClientDevice {
     let user_agent = header_str(headers, "user-agent").unwrap_or("");
     let app_version = immich_app_version(user_agent);
     let (browser, os) = browser_and_os(user_agent);
@@ -377,7 +396,7 @@ fn valid_email(email: &str) -> bool {
         && !domain.contains('@')
 }
 
-fn append_cookie(headers: &mut HeaderMap, value: String) {
+pub(crate) fn append_cookie(headers: &mut HeaderMap, value: String) {
     headers.append(header::SET_COOKIE, value.parse().expect("set-cookie"));
 }
 

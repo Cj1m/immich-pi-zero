@@ -5,6 +5,8 @@ mod admin;
 mod http_admin;
 mod libraries;
 mod http_libraries;
+mod oauth;
+mod http_oauth;
 mod activity;
 mod albums;
 mod browse;

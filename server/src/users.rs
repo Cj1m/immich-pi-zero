@@ -1076,7 +1076,7 @@ fn unique_message(error: &sqlx::Error) -> Option<&'static str> {
 }
 
 /// `sanitize-filename`: drop reserved characters, Windows device names, and trailing dots.
-fn sanitize_filename(input: &str) -> String {
+pub(crate) fn sanitize_filename(input: &str) -> String {
     let mut out = String::new();
     for character in input.chars() {
         let code = character as u32;
