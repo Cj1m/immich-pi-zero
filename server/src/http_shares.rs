@@ -29,6 +29,19 @@ pub(crate) struct ShareQuery {
     pub visibility: Option<String>,
     #[serde(rename = "userId")]
     pub user_id: Option<String>,
+    #[serde(rename = "personId")]
+    pub person_id: Option<String>,
+    #[serde(rename = "tagId")]
+    pub tag_id: Option<String>,
+    #[serde(rename = "isFavorite")]
+    pub is_favorite: Option<String>,
+    #[serde(rename = "isTrashed")]
+    pub is_trashed: Option<String>,
+    #[serde(rename = "withStacked")]
+    pub with_stacked: Option<String>,
+    #[serde(rename = "orderBy")]
+    pub order_by: Option<String>,
+    pub bbox: Option<String>,
     pub size: Option<String>,
 }
 
@@ -335,19 +348,9 @@ async fn timeline_buckets(
         Ok(auth) => auth,
         Err(response) => return response,
     };
-    let with_partners = match flag_text(query.with_partners.as_deref()) {
-        Ok(value) => value,
+    let request = match timeline_request(&auth, &query) {
+        Ok(request) => request,
         Err(text) => return message(StatusCode::BAD_REQUEST, text),
-    };
-    let request = crate::shares::TimelineRequest {
-        user_id: user_id(&auth),
-        grant: grant(&auth),
-        album_id: query.album_id.as_deref(),
-        order: query.order.as_deref().unwrap_or("desc"),
-        with_partners,
-        visibility: query.visibility.as_deref(),
-        requested_user: query.user_id.as_deref(),
-        elevated: elevated(&auth),
     };
     match app.timeline_buckets(&request).await {
         Ok(body) => json_ok(body),
@@ -368,19 +371,9 @@ async fn timeline_bucket(
         Err(response) => return response,
     };
     let coordinates = matches!(query.with_coordinates.as_deref(), Some("true" | "1"));
-    let with_partners = match flag_text(query.with_partners.as_deref()) {
-        Ok(value) => value,
+    let request = match timeline_request(&auth, &query) {
+        Ok(request) => request,
         Err(text) => return message(StatusCode::BAD_REQUEST, text),
-    };
-    let request = crate::shares::TimelineRequest {
-        user_id: user_id(&auth),
-        grant: grant(&auth),
-        album_id: query.album_id.as_deref(),
-        order: query.order.as_deref().unwrap_or("desc"),
-        with_partners,
-        visibility: query.visibility.as_deref(),
-        requested_user: query.user_id.as_deref(),
-        elevated: elevated(&auth),
     };
     match app
         .timeline_bucket(&request, &time_bucket, coordinates)
@@ -575,6 +568,42 @@ fn flag_text(value: Option<&str>) -> Result<bool, &'static str> {
         Some("true") => Ok(true),
         Some(_) => Err("Validation failed"),
     }
+}
+
+fn optional_flag(value: Option<&str>) -> Result<Option<bool>, &'static str> {
+    match value {
+        None => Ok(None),
+        Some("true") => Ok(Some(true)),
+        Some("false") => Ok(Some(false)),
+        Some(_) => Err("Validation failed"),
+    }
+}
+
+fn timeline_request<'a>(
+    auth: &'a LibraryAuth,
+    query: &'a ShareQuery,
+) -> Result<crate::shares::TimelineRequest<'a>, &'static str> {
+    let with_partners = flag_text(query.with_partners.as_deref())?;
+    let is_favorite = optional_flag(query.is_favorite.as_deref())?;
+    let is_trashed = optional_flag(query.is_trashed.as_deref())?.unwrap_or(false);
+    let with_stacked = flag_text(query.with_stacked.as_deref())?;
+    Ok(crate::shares::TimelineRequest {
+        user_id: user_id(auth),
+        grant: grant(auth),
+        album_id: query.album_id.as_deref(),
+        order: query.order.as_deref().unwrap_or("desc"),
+        with_partners,
+        visibility: query.visibility.as_deref(),
+        requested_user: query.user_id.as_deref(),
+        elevated: elevated(auth),
+        person_id: query.person_id.as_deref(),
+        tag_id: query.tag_id.as_deref(),
+        is_favorite,
+        is_trashed,
+        with_stacked,
+        order_by: query.order_by.as_deref().unwrap_or("takenAt"),
+        bbox: query.bbox.as_deref(),
+    })
 }
 
 fn string_ids(value: Option<&Value>) -> Vec<String> {

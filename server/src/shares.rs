@@ -102,6 +102,10 @@ struct BucketAsset {
     country: Option<String>,
     latitude: Option<f64>,
     longitude: Option<f64>,
+    deleted_at: Option<String>,
+    status: String,
+    stack_id: Option<String>,
+    stack_count: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -534,19 +538,24 @@ impl App {
         &self,
         request: &TimelineRequest<'_>,
     ) -> Result<Value, ApiError> {
-        self.require_timeline_album(request.user_id, request.grant, request.album_id)
-            .await?;
-        let locked = locked_timeline(request)?;
-        let partners = timeline_partners(request);
-        let desc = request.order != "asc";
-        let sql = bucket_month_sql(request.album_id.is_some(), partners, desc, locked);
+        let scope = self.timeline_scope(request).await?;
+        let (filter, binds) = timeline_filter(&scope);
+        let date = timeline_date(&scope);
+        let direction = if scope.desc { "DESC" } else { "ASC" };
+        let sql = format!(
+            "SELECT substr({date}, 1, 7) AS month, COUNT(*) AS count
+             FROM asset
+             LEFT JOIN asset_exif ON asset_exif.assetId = asset.id
+             WHERE {filter}
+             GROUP BY month
+             ORDER BY month {direction}"
+        );
         let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
-        query = match request.album_id {
-            Some(album_id) => query.bind(album_id),
-            None => query.bind(request.user_id),
-        };
-        if partners {
-            query = query.bind(request.user_id);
+        for bind in binds {
+            query = match bind {
+                Bind::Text(value) => query.bind(value),
+                Bind::Float(value) => query.bind(value),
+            };
         }
         let rows = query.fetch_all(self.pool()).await?;
         let buckets = rows
@@ -562,25 +571,199 @@ impl App {
         time_bucket: &str,
         with_coordinates: bool,
     ) -> Result<Value, ApiError> {
-        self.require_timeline_album(request.user_id, request.grant, request.album_id)
-            .await?;
+        let scope = self.timeline_scope(request).await?;
         let show_place = request.grant.is_none_or(|grant| grant.show_metadata);
         let coordinates = with_coordinates && show_place;
-        let locked = locked_timeline(request)?;
-        let partners = timeline_partners(request);
-        let month = month_key(time_bucket);
-        let desc = request.order != "asc";
-        let sql = bucket_asset_sql(request.album_id.is_some(), partners, desc, locked);
-        let mut query = sqlx::query_as::<_, BucketAsset>(&sql).bind(month);
-        query = match request.album_id {
-            Some(album_id) => query.bind(album_id),
-            None => query.bind(request.user_id),
+        let (filter, binds) = timeline_filter(&scope);
+        let date = timeline_date(&scope);
+        let direction = if scope.desc { "DESC" } else { "ASC" };
+        let order = if scope.created {
+            "asset.createdAt".to_string()
+        } else {
+            format!("substr({date}, 1, 10)")
         };
-        if partners {
-            query = query.bind(request.user_id);
+        let sql = format!(
+            "SELECT asset.id AS id, asset.duration AS duration, asset.visibility AS visibility,
+                    asset.isFavorite AS is_favorite, asset.type AS asset_type,
+                    asset.livePhotoVideoId AS live_photo_video_id,
+                    asset.fileCreatedAt AS file_created_at, asset.localDateTime AS local_date_time,
+                    asset.createdAt AS created_at, asset.ownerId AS owner_id,
+                    asset.width AS width, asset.height AS height, asset.thumbhash AS thumbhash,
+                    asset.deletedAt AS deleted_at, asset.status AS status, asset.stackId AS stack_id,
+                    (SELECT COUNT(*) FROM asset AS stacked
+                     WHERE stacked.stackId = asset.stackId AND asset.stackId IS NOT NULL
+                       AND stacked.deletedAt IS NULL AND stacked.visibility = 'timeline') AS stack_count,
+                    asset_exif.projectionType AS projection_type, asset_exif.city AS city,
+                    asset_exif.country AS country, asset_exif.latitude AS latitude,
+                    asset_exif.longitude AS longitude
+             FROM asset
+             LEFT JOIN asset_exif ON asset_exif.assetId = asset.id
+             WHERE substr({date}, 1, 7) = ? AND {filter}
+             ORDER BY {order} {direction}, asset.fileCreatedAt {direction},
+                      asset.originalFileName {direction}"
+        );
+        let mut query = sqlx::query_as::<_, BucketAsset>(&sql).bind(month_key(time_bucket));
+        for bind in binds {
+            query = match bind {
+                Bind::Text(value) => query.bind(value),
+                Bind::Float(value) => query.bind(value),
+            };
         }
         let rows = query.fetch_all(self.pool()).await?;
-        Ok(bucket_json(&rows, show_place, coordinates))
+        Ok(bucket_json(
+            &rows,
+            show_place,
+            coordinates,
+            &scope.caller_id,
+            scope.stacked,
+        ))
+    }
+
+    async fn timeline_scope(&self, request: &TimelineRequest<'_>) -> Result<TimelineScope, ApiError> {
+        if request.order != "asc" && request.order != "desc" {
+            return Err(validation());
+        }
+        if request.order_by != "takenAt" && request.order_by != "createdAt" {
+            return Err(validation());
+        }
+        if let Some(visibility) = request.visibility {
+            if !matches!(visibility, "timeline" | "archive" | "hidden" | "locked") {
+                return Err(validation());
+            }
+        }
+        for id in [
+            request.album_id,
+            request.person_id,
+            request.tag_id,
+            request.requested_user,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !is_uuid_v4(id) {
+                return Err(validation());
+            }
+        }
+        let bbox = parse_bbox(request.bbox)?;
+        if request.visibility == Some("locked") {
+            if !request.elevated {
+                return Err(ApiError::text(
+                    StatusCode::UNAUTHORIZED,
+                    "Elevated permission is required",
+                ));
+            }
+            if request
+                .requested_user
+                .is_some_and(|id| id != request.user_id)
+            {
+                return Err(ApiError::text(
+                    StatusCode::BAD_REQUEST,
+                    "You may not access another user's locked timeline",
+                ));
+            }
+        }
+        let default_or_archive = request.visibility.is_none() || request.visibility == Some("archive");
+        if request.with_partners
+            && (request.visibility == Some("locked") || default_or_archive || request.is_favorite.is_some() || request.is_trashed)
+        {
+            return Err(ApiError::text(
+                StatusCode::BAD_REQUEST,
+                "withPartners is only supported for non-archived, non-trashed, non-favorited, non-locked assets",
+            ));
+        }
+        self.require_timeline_album(request.user_id, request.grant, request.album_id)
+            .await?;
+        if let Some(tag_id) = request.tag_id {
+            if !self.tag_is_owned(request.user_id, tag_id).await? {
+                return Err(ApiError::text(
+                    StatusCode::BAD_REQUEST,
+                    "Not found or no tag.read access",
+                ));
+            }
+        }
+        let mut owners = Vec::new();
+        let mut shared_album_user = None;
+        let signed_in = request.grant.is_none();
+        let filter_owners = signed_in && (request.album_id.is_none() || request.requested_user.is_some());
+        if filter_owners {
+            let target = request.requested_user.unwrap_or(request.user_id);
+            if target != request.user_id {
+                if !self.is_timeline_partner(request.user_id, target).await? {
+                    return Err(ApiError::text(
+                        StatusCode::BAD_REQUEST,
+                        "Not found or no timeline.read access",
+                    ));
+                }
+                if request.visibility == Some("archive") {
+                    return Err(ApiError::text(
+                        StatusCode::BAD_REQUEST,
+                        "Not found or no archive.read access",
+                    ));
+                }
+            }
+            owners.push(target.to_string());
+            if request.with_partners {
+                owners.extend(
+                    self.partner_owner_ids(request.user_id, request.person_id.is_none())
+                        .await?,
+                );
+            }
+            if request.person_id.is_some() {
+                shared_album_user = Some(request.user_id.to_string());
+            }
+        }
+        Ok(TimelineScope {
+            album_id: request.album_id.map(str::to_string),
+            owners,
+            shared_album_user,
+            person_id: request.person_id.map(str::to_string),
+            tag_id: request.tag_id.map(str::to_string),
+            visibility: request.visibility.map(str::to_string),
+            is_favorite: request.is_favorite,
+            trashed: request.is_trashed,
+            stacked: request.with_stacked,
+            bbox,
+            created: request.order_by == "createdAt",
+            desc: request.order != "asc",
+            caller_id: request.user_id.to_string(),
+        })
+    }
+
+    async fn tag_is_owned(&self, user_id: &str, tag_id: &str) -> Result<bool, DbError> {
+        let found: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM tag WHERE id = ? AND userId = ?")
+                .bind(tag_id)
+                .bind(user_id)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(found.is_some())
+    }
+
+    async fn is_timeline_partner(&self, caller: &str, owner: &str) -> Result<bool, DbError> {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM partner
+             JOIN user ON user.id = partner.sharedById
+             WHERE partner.sharedById = ? AND partner.sharedWithId = ? AND user.deletedAt IS NULL",
+        )
+        .bind(owner)
+        .bind(caller)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(found.is_some())
+    }
+
+    async fn partner_owner_ids(&self, user_id: &str, require_timeline: bool) -> Result<Vec<String>, DbError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT partner.sharedById FROM partner
+             JOIN user ON user.id = partner.sharedById
+             WHERE partner.sharedWithId = ? AND user.deletedAt IS NULL
+               AND (? = 0 OR partner.inTimeline = 1)",
+        )
+        .bind(user_id)
+        .bind(i64::from(require_timeline))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
     }
 
     pub(crate) async fn map_markers(
@@ -1208,61 +1391,185 @@ fn push_archive(
     ));
 }
 
-fn bucket_month_sql(album: bool, partners: bool, desc: bool, locked: bool) -> String {
-    let direction = if desc { "DESC" } else { "ASC" };
-    let visibility = if locked { "locked" } else { "timeline" };
-    let (from, filter) = if album {
-        (
-            "FROM asset JOIN album_asset ON album_asset.assetId = asset.id",
-            "album_asset.albumId = ?",
-        )
-    } else if partners {
-        ("FROM asset", PARTNER_TIMELINE)
-    } else {
-        ("FROM asset", "asset.ownerId = ?")
-    };
-    format!(
-        "SELECT substr(asset.localDateTime, 1, 7) AS month, COUNT(*) AS count
-         {from}
-         WHERE {filter} AND asset.deletedAt IS NULL AND asset.visibility = '{visibility}'
-         GROUP BY month
-         ORDER BY month {direction}"
-    )
+struct TimelineScope {
+    album_id: Option<String>,
+    owners: Vec<String>,
+    shared_album_user: Option<String>,
+    person_id: Option<String>,
+    tag_id: Option<String>,
+    visibility: Option<String>,
+    is_favorite: Option<bool>,
+    trashed: bool,
+    stacked: bool,
+    bbox: Option<BoundingBox>,
+    created: bool,
+    desc: bool,
+    caller_id: String,
 }
 
-fn bucket_asset_sql(album: bool, partners: bool, desc: bool, locked: bool) -> String {
-    let direction = if desc { "DESC" } else { "ASC" };
-    let visibility = if locked { "locked" } else { "timeline" };
-    let (from, filter) = if album {
-        (
-            "FROM asset JOIN album_asset ON album_asset.assetId = asset.id",
-            "album_asset.albumId = ?",
-        )
-    } else if partners {
-        ("FROM asset", PARTNER_TIMELINE)
-    } else {
-        ("FROM asset", "asset.ownerId = ?")
-    };
-    format!(
-        "SELECT asset.id AS id, asset.duration AS duration, asset.visibility AS visibility,
-                asset.isFavorite AS is_favorite, asset.type AS asset_type,
-                asset.livePhotoVideoId AS live_photo_video_id,
-                asset.fileCreatedAt AS file_created_at, asset.localDateTime AS local_date_time,
-                asset.createdAt AS created_at, asset.ownerId AS owner_id,
-                asset.width AS width, asset.height AS height, asset.thumbhash AS thumbhash,
-                asset_exif.projectionType AS projection_type, asset_exif.city AS city,
-                asset_exif.country AS country, asset_exif.latitude AS latitude,
-                asset_exif.longitude AS longitude
-         {from}
-         LEFT JOIN asset_exif ON asset_exif.assetId = asset.id
-         WHERE substr(asset.localDateTime, 1, 7) = ? AND {filter}
-           AND asset.deletedAt IS NULL AND asset.visibility = '{visibility}'
-         ORDER BY asset.localDateTime {direction}, asset.fileCreatedAt {direction},
-                  asset.originalFileName {direction}"
-    )
+struct BoundingBox {
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
 }
 
-fn bucket_json(rows: &[BucketAsset], show_place: bool, coordinates: bool) -> Value {
+enum Bind {
+    Text(String),
+    Float(f64),
+}
+
+fn timeline_date(scope: &TimelineScope) -> &'static str {
+    if scope.created {
+        "asset.createdAt"
+    } else {
+        "asset.localDateTime"
+    }
+}
+
+fn timeline_filter(scope: &TimelineScope) -> (String, Vec<Bind>) {
+    let mut sql = String::from("1 = 1");
+    let mut binds = Vec::new();
+    if scope.trashed {
+        sql.push_str(" AND asset.deletedAt IS NOT NULL AND asset.status != 'deleted'");
+    } else {
+        sql.push_str(" AND asset.deletedAt IS NULL");
+    }
+    if let Some(visibility) = &scope.visibility {
+        sql.push_str(" AND asset.visibility = ?");
+        binds.push(Bind::Text(visibility.clone()));
+    } else {
+        sql.push_str(" AND asset.visibility IN ('timeline', 'archive')");
+    }
+    if let Some(album_id) = &scope.album_id {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM album_asset WHERE album_asset.albumId = ? AND album_asset.assetId = asset.id)",
+        );
+        binds.push(Bind::Text(album_id.clone()));
+    }
+    if !scope.owners.is_empty() {
+        let marks = vec!["?"; scope.owners.len()].join(", ");
+        if let Some(user_id) = &scope.shared_album_user {
+            sql.push_str(&format!(
+                " AND (asset.ownerId IN ({marks}) OR EXISTS (
+                    SELECT 1 FROM album_asset
+                    INNER JOIN album ON album.id = album_asset.albumId AND album.deletedAt IS NULL
+                    INNER JOIN album_user ON album_user.albumId = album.id AND album_user.userId = ?
+                    WHERE album_asset.assetId = asset.id
+                ))"
+            ));
+            for owner in &scope.owners {
+                binds.push(Bind::Text(owner.clone()));
+            }
+            binds.push(Bind::Text(user_id.clone()));
+        } else {
+            sql.push_str(&format!(" AND asset.ownerId IN ({marks})"));
+            for owner in &scope.owners {
+                binds.push(Bind::Text(owner.clone()));
+            }
+        }
+    } else if scope.album_id.is_none() {
+        sql.push_str(" AND 0");
+    }
+    if let Some(person_id) = &scope.person_id {
+        sql.push_str(
+            " AND EXISTS (
+                SELECT 1 FROM asset_face
+                WHERE asset_face.assetId = asset.id AND asset_face.personGroupId = ?
+                  AND asset_face.deletedAt IS NULL AND asset_face.isVisible = 1
+            )",
+        );
+        binds.push(Bind::Text(person_id.clone()));
+    }
+    if let Some(tag_id) = &scope.tag_id {
+        sql.push_str(
+            " AND EXISTS (
+                SELECT 1 FROM tag_closure
+                INNER JOIN tag_asset ON tag_asset.tagId = tag_closure.id_descendant
+                WHERE tag_asset.assetId = asset.id AND tag_closure.id_ancestor = ?
+            )",
+        );
+        binds.push(Bind::Text(tag_id.clone()));
+    }
+    match scope.is_favorite {
+        Some(true) => sql.push_str(" AND asset.isFavorite != 0"),
+        Some(false) => sql.push_str(" AND asset.isFavorite = 0"),
+        None => {}
+    }
+    if scope.stacked {
+        sql.push_str(
+            " AND (asset.stackId IS NULL OR EXISTS (
+                SELECT 1 FROM stack WHERE stack.id = asset.stackId AND stack.primaryAssetId = asset.id
+            ))",
+        );
+    }
+    if let Some(bbox) = &scope.bbox {
+        sql.push_str(" AND asset_exif.latitude >= ? AND asset_exif.latitude <= ?");
+        binds.push(Bind::Float(bbox.south));
+        binds.push(Bind::Float(bbox.north));
+        if bbox.west <= bbox.east {
+            sql.push_str(" AND asset_exif.longitude >= ? AND asset_exif.longitude <= ?");
+            binds.push(Bind::Float(bbox.west));
+            binds.push(Bind::Float(bbox.east));
+        } else {
+            sql.push_str(" AND (asset_exif.longitude >= ? OR asset_exif.longitude <= ?)");
+            binds.push(Bind::Float(bbox.west));
+            binds.push(Bind::Float(bbox.east));
+        }
+    }
+    (sql, binds)
+}
+
+fn parse_bbox(value: Option<&str>) -> Result<Option<BoundingBox>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let parts: Vec<&str> = value.split(',').collect();
+    if parts.len() != 4 {
+        return Err(validation());
+    }
+    let mut numbers = [0.0; 4];
+    for (index, part) in parts.iter().enumerate() {
+        let Ok(number) = part.trim().parse::<f64>() else {
+            return Err(validation());
+        };
+        if !number.is_finite() {
+            return Err(validation());
+        }
+        numbers[index] = number;
+    }
+    let [west, south, east, north] = numbers;
+    if !(-180.0..=180.0).contains(&west)
+        || !(-180.0..=180.0).contains(&east)
+        || !(-90.0..=90.0).contains(&south)
+        || !(-90.0..=90.0).contains(&north)
+        || north < south
+    {
+        return Err(validation());
+    }
+    Ok(Some(BoundingBox {
+        west,
+        south,
+        east,
+        north,
+    }))
+}
+
+fn validation() -> ApiError {
+    ApiError::text(StatusCode::BAD_REQUEST, "Validation failed")
+}
+
+fn is_uuid_v4(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|id| id.get_version() == Some(uuid::Version::Random))
+}
+
+fn bucket_json(
+    rows: &[BucketAsset],
+    show_place: bool,
+    coordinates: bool,
+    caller: &str,
+    stacked: bool,
+) -> Value {
     let mut ids = Vec::new();
     let mut duration = Vec::new();
     let mut visibility = Vec::new();
@@ -1281,13 +1588,14 @@ fn bucket_json(rows: &[BucketAsset], show_place: bool, coordinates: bool) -> Val
     let mut country = Vec::new();
     let mut latitude = Vec::new();
     let mut longitude = Vec::new();
+    let mut stacks = Vec::new();
     for row in rows {
         ids.push(json!(row.id));
         duration.push(json!(row.duration));
         visibility.push(json!(row.visibility));
-        is_favorite.push(json!(row.is_favorite != 0));
+        is_favorite.push(json!(row.is_favorite != 0 && row.owner_id == caller));
         is_image.push(json!(row.asset_type == "IMAGE"));
-        is_trashed.push(json!(false));
+        is_trashed.push(json!(row.deleted_at.is_some()));
         live_photo.push(json!(row.live_photo_video_id));
         file_created_at.push(json!(row.file_created_at));
         offset_hours.push(json!(offset_hours_between(
@@ -1310,6 +1618,12 @@ fn bucket_json(rows: &[BucketAsset], show_place: bool, coordinates: bool) -> Val
             latitude.push(json!(row.latitude));
             longitude.push(json!(row.longitude));
         }
+        if stacked {
+            stacks.push(match &row.stack_id {
+                Some(stack_id) => json!([stack_id, row.stack_count.to_string()]),
+                None => Value::Null,
+            });
+        }
     }
     let mut value = json!({
         "id": ids,
@@ -1326,8 +1640,11 @@ fn bucket_json(rows: &[BucketAsset], show_place: bool, coordinates: bool) -> Val
         "projectionType": projection,
         "ratio": ratio,
         "thumbhash": thumbhash,
-        "status": vec![json!("active"); rows.len()],
+        "status": rows.iter().map(|row| json!(row.status)).collect::<Vec<_>>(),
     });
+    if stacked {
+        value["stack"] = json!(stacks);
+    }
     if show_place {
         value["city"] = json!(city);
         value["country"] = json!(country);
@@ -1358,12 +1675,6 @@ fn offset_hours_between(local: &str, file_created: &str) -> f64 {
     (local.timestamp() - file_created.timestamp()) as f64 / 3600.0
 }
 
-/// Main timeline only. Album buckets stay on the album, and a partner is included
-/// only when that recipient has turned `inTimeline` on.
-const PARTNER_TIMELINE: &str = "(asset.ownerId = ? OR asset.ownerId IN (
-    SELECT sharedById FROM partner WHERE sharedWithId = ? AND inTimeline = 1
-))";
-
 pub(crate) struct TimelineRequest<'a> {
     pub user_id: &'a str,
     pub grant: Option<&'a ShareGrant>,
@@ -1373,38 +1684,13 @@ pub(crate) struct TimelineRequest<'a> {
     pub visibility: Option<&'a str>,
     pub requested_user: Option<&'a str>,
     pub elevated: bool,
-}
-
-fn locked_timeline(request: &TimelineRequest<'_>) -> Result<bool, ApiError> {
-    if request.visibility != Some("locked") {
-        return Ok(false);
-    }
-    if !request.elevated {
-        return Err(ApiError::text(
-            StatusCode::UNAUTHORIZED,
-            "Elevated permission is required",
-        ));
-    }
-    if request.with_partners {
-        return Err(ApiError::text(
-            StatusCode::BAD_REQUEST,
-            "withPartners is only supported for non-archived, non-trashed, non-favorited, non-locked assets",
-        ));
-    }
-    if request
-        .requested_user
-        .is_some_and(|id| id != request.user_id)
-    {
-        return Err(ApiError::text(
-            StatusCode::BAD_REQUEST,
-            "You may not access another user's locked timeline",
-        ));
-    }
-    Ok(true)
-}
-
-fn timeline_partners(request: &TimelineRequest<'_>) -> bool {
-    request.with_partners && request.album_id.is_none() && request.grant.is_none()
+    pub person_id: Option<&'a str>,
+    pub tag_id: Option<&'a str>,
+    pub is_favorite: Option<bool>,
+    pub is_trashed: bool,
+    pub with_stacked: bool,
+    pub order_by: &'a str,
+    pub bbox: Option<&'a str>,
 }
 
 fn month_key(time_bucket: &str) -> String {

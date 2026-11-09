@@ -1709,3 +1709,99 @@ fn unique_ids(value: Option<&Value>) -> Result<Vec<String>, PeopleError> {
     }
     Ok(ids)
 }
+
+#[derive(sqlx::FromRow)]
+struct FaceListRow {
+    id: String,
+    image_width: i64,
+    image_height: i64,
+    x1: i64,
+    y1: i64,
+    x2: i64,
+    y2: i64,
+    source_type: String,
+    person_group_id: Option<String>,
+    name: Option<String>,
+    birth_date: Option<String>,
+    thumbnail_path: Option<String>,
+    is_hidden: Option<i64>,
+    is_favorite: Option<i64>,
+    color: Option<String>,
+    updated_at: Option<String>,
+}
+
+impl App {
+    pub(crate) async fn asset_people(&self, asset_id: &str, viewer_id: &str) -> Result<Value, DbError> {
+        let rows: Vec<PersonRow> = sqlx::query_as(
+            "SELECT person.personGroupId AS person_group_id, person.name AS name,
+                    person.birthDate AS birth_date, person.thumbnailPath AS thumbnail_path,
+                    person.isHidden AS is_hidden, person.isFavorite AS is_favorite,
+                    person.color AS color, person.updatedAt AS updated_at
+             FROM person
+             WHERE person.ownerId = ?
+               AND person.personGroupId IN (
+                    SELECT personGroupId FROM asset_face
+                    WHERE assetId = ? AND deletedAt IS NULL AND isVisible = 1
+                      AND personGroupId IS NOT NULL
+               )
+             ORDER BY person.name, person.personGroupId",
+        )
+        .bind(viewer_id)
+        .bind(asset_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(Value::Array(rows.into_iter().map(person_json).collect()))
+    }
+
+    pub(crate) async fn asset_faces(&self, asset_id: &str, viewer_id: &str) -> Result<Value, DbError> {
+        let rows: Vec<FaceListRow> = sqlx::query_as(
+            "SELECT asset_face.id AS id, asset_face.imageWidth AS image_width,
+                    asset_face.imageHeight AS image_height, asset_face.boundingBoxX1 AS x1,
+                    asset_face.boundingBoxY1 AS y1, asset_face.boundingBoxX2 AS x2,
+                    asset_face.boundingBoxY2 AS y2, asset_face.sourceType AS source_type,
+                    person.personGroupId AS person_group_id, person.name AS name,
+                    person.birthDate AS birth_date, person.thumbnailPath AS thumbnail_path,
+                    person.isHidden AS is_hidden, person.isFavorite AS is_favorite,
+                    person.color AS color, person.updatedAt AS updated_at
+             FROM asset_face
+             LEFT JOIN person ON person.personGroupId = asset_face.personGroupId
+                              AND person.ownerId = ?
+             WHERE asset_face.assetId = ? AND asset_face.deletedAt IS NULL
+               AND asset_face.isVisible = 1
+             ORDER BY asset_face.id",
+        )
+        .bind(viewer_id)
+        .bind(asset_id)
+        .fetch_all(self.pool())
+        .await?;
+        let faces = rows
+            .into_iter()
+            .map(|row| {
+                let person = row.person_group_id.map(|id| {
+                    person_json(PersonRow {
+                        person_group_id: id,
+                        name: row.name.unwrap_or_default(),
+                        birth_date: row.birth_date,
+                        thumbnail_path: row.thumbnail_path.unwrap_or_default(),
+                        is_hidden: row.is_hidden.unwrap_or(0),
+                        is_favorite: row.is_favorite.unwrap_or(0),
+                        color: row.color,
+                        updated_at: row.updated_at.unwrap_or_default(),
+                    })
+                });
+                json!({
+                    "id": row.id,
+                    "imageWidth": row.image_width,
+                    "imageHeight": row.image_height,
+                    "boundingBoxX1": row.x1,
+                    "boundingBoxY1": row.y1,
+                    "boundingBoxX2": row.x2,
+                    "boundingBoxY2": row.y2,
+                    "sourceType": row.source_type,
+                    "person": person,
+                })
+            })
+            .collect();
+        Ok(Value::Array(faces))
+    }
+}

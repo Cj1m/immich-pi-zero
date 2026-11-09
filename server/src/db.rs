@@ -892,6 +892,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 18 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V18.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (18)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -1497,6 +1515,28 @@ CREATE TABLE library (
 );
 CREATE INDEX library_owner ON library(ownerId);
 CREATE INDEX library_update ON library(updateId);
+";
+
+const SCHEMA_V18: &str = "
+CREATE TABLE asset_ocr (
+    id TEXT PRIMARY KEY NOT NULL,
+    assetId TEXT NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+    x1 REAL NOT NULL,
+    y1 REAL NOT NULL,
+    x2 REAL NOT NULL,
+    y2 REAL NOT NULL,
+    x3 REAL NOT NULL,
+    y3 REAL NOT NULL,
+    x4 REAL NOT NULL,
+    y4 REAL NOT NULL,
+    boxScore REAL NOT NULL,
+    textScore REAL NOT NULL,
+    text TEXT NOT NULL,
+    isVisible INTEGER NOT NULL DEFAULT 1,
+    updatedAt TEXT NOT NULL,
+    updateId TEXT NOT NULL
+);
+CREATE INDEX asset_ocr_asset ON asset_ocr(assetId);
 ";
 
 struct LiveSocket {

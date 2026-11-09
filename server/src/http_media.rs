@@ -35,6 +35,7 @@ pub fn routes() -> Router<App> {
         )
         .route("/api/assets/{id}/original", get(download_original))
         .route("/api/assets/{id}/thumbnail", get(download_thumbnail))
+        .route("/api/assets/{id}/ocr", get(asset_ocr))
         .route("/api/sync/stream", post(sync_stream))
         .route(
             "/api/sync/ack",
@@ -302,14 +303,88 @@ async fn get_asset(
             Err(error) => db_error(error),
         };
     }
-    if let Err(response) =
-        reject_locked(&app, user_id(&auth), &id, elevated(&auth), "asset.read").await
-    {
+    let caller = user_id(&auth);
+    let owner = match app.asset_gate(caller, &id).await {
+        Ok(Ok(owner)) => owner,
+        Ok(Err(false)) => return message(StatusCode::BAD_REQUEST, "Asset not found"),
+        Ok(Err(true)) => {
+            return message(StatusCode::BAD_REQUEST, "Not found or no asset.read access")
+        }
+        Err(error) => return db_error(error),
+    };
+    if let Err(response) = reject_locked(&app, &owner, &id, elevated(&auth), "asset.read").await {
         return response;
     }
-    match app.asset_json(user_id(&auth), &id).await {
+    match app.asset_json(&owner, &id).await {
+        Ok(mut body) => {
+            if caller != owner {
+                match app.asset_people(&id, caller).await {
+                    Ok(people) => body["people"] = people,
+                    Err(error) => return db_error(error),
+                }
+            }
+            json_ok(body)
+        }
+        Err(DbError::NotFound) => message(StatusCode::BAD_REQUEST, "Asset not found"),
+        Err(error) => db_error(error),
+    }
+}
+
+async fn asset_ocr(State(app): State<App>, Path(id): Path<String>, request: Request) -> Response {
+    let headers = request.headers().clone();
+    let query = request.uri().query().unwrap_or("");
+    let caller = match signed_in(&app, &headers, query).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    let session = match require_session(&app, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if let Err(error) = readable_asset(&app, &caller, &id, session.elevated).await {
+        return asset_read_response(error);
+    }
+    match app.asset_ocr(&id).await {
         Ok(body) => json_ok(body),
         Err(error) => db_error(error),
+    }
+}
+
+pub(crate) enum AssetRead {
+    Validation,
+    Missing,
+    Denied,
+    Database(DbError),
+}
+
+pub(crate) fn asset_read_response(error: AssetRead) -> Response {
+    match error {
+        AssetRead::Validation => message(StatusCode::BAD_REQUEST, "Validation failed"),
+        AssetRead::Missing => message(StatusCode::BAD_REQUEST, "Asset not found"),
+        AssetRead::Denied => message(StatusCode::BAD_REQUEST, "Not found or no asset.read access"),
+        AssetRead::Database(error) => db_error(error),
+    }
+}
+
+pub(crate) async fn readable_asset(
+    app: &App,
+    caller: &str,
+    asset_id: &str,
+    elevated: bool,
+) -> Result<String, AssetRead> {
+    if uuid::Uuid::parse_str(asset_id).is_err() {
+        return Err(AssetRead::Validation);
+    }
+    let owner = match app.asset_gate(caller, asset_id).await {
+        Ok(Ok(owner)) => owner,
+        Ok(Err(false)) => return Err(AssetRead::Missing),
+        Ok(Err(true)) => return Err(AssetRead::Denied),
+        Err(error) => return Err(AssetRead::Database(error)),
+    };
+    match app.asset_visibility(&owner, asset_id).await {
+        Ok(Some(visibility)) if visibility == "locked" && !elevated => Err(AssetRead::Denied),
+        Ok(_) => Ok(owner),
+        Err(error) => Err(AssetRead::Database(error)),
     }
 }
 

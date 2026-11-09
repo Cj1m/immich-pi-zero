@@ -27,8 +27,37 @@ pub(crate) fn routes() -> Router<App> {
             "/api/people/{id}",
             get(person).put(update_person).patch(update_person),
         )
+        .route("/api/faces", get(asset_faces))
         .route("/api/faces/{id}", put(reassign_face).delete(delete_face))
         .route("/api/search/person", get(search_person))
+}
+
+async fn asset_faces(State(app): State<App>, request: Request) -> Response {
+    let headers = request.headers().clone();
+    let raw_query = request.uri().query().unwrap_or("").to_string();
+    let caller = match crate::http_duplicates::signed_in(&app, &headers, &raw_query).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    let session = match require_session(&app, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let Some(id) = query_pairs(&raw_query)
+        .into_iter()
+        .find(|(name, _)| name == "id")
+        .map(|(_, value)| value)
+        .filter(|id| !id.is_empty())
+    else {
+        return message(StatusCode::BAD_REQUEST, "Validation failed");
+    };
+    if let Err(error) = crate::http_media::readable_asset(&app, &caller, &id, session.elevated).await {
+        return crate::http_media::asset_read_response(error);
+    }
+    match app.asset_faces(&id, &caller).await {
+        Ok(body) => json_ok(body),
+        Err(error) => db_error(error),
+    }
 }
 
 async fn list_people(State(app): State<App>, request: Request) -> Response {

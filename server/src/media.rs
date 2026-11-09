@@ -303,6 +303,9 @@ impl App {
         }
         let mut value = self.asset_value(&record).await?;
         value["people"] = json!([]);
+        if let Some(object) = value.as_object_mut() {
+            object.remove("owner");
+        }
         Ok(value)
     }
 
@@ -396,7 +399,94 @@ impl App {
         };
         let mut value = asset_json(record, stack);
         value["tags"] = self.asset_tag_documents(&record.id).await?;
+        value["people"] = self.asset_people(&record.id, &record.owner_id).await?;
+        value["edits"] = json!([]);
+        value["owner"] = self.owner_brief(&record.owner_id).await?;
         Ok(value)
+    }
+
+    pub(crate) async fn owner_brief(&self, user_id: &str) -> Result<Value, DbError> {
+        let Some(user) = self.read_user(user_id, true).await? else {
+            return Ok(Value::Null);
+        };
+        Ok(json!({
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "profileImagePath": user.profile_image_path,
+            "avatarColor": user.avatar_color,
+            "profileChangedAt": user.profile_changed_at,
+        }))
+    }
+
+    /// `Ok` is the owner id. `Err(false)` means the row is missing. `Err(true)` means no read access.
+    pub(crate) async fn asset_gate(&self, caller: &str, asset_id: &str) -> Result<std::result::Result<String, bool>, DbError> {
+        let exists: Option<String> = sqlx::query_scalar("SELECT id FROM asset WHERE id = ?")
+            .bind(asset_id)
+            .fetch_optional(self.pool())
+            .await?;
+        if exists.is_none() {
+            return Ok(Err(false));
+        }
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT ownerId FROM asset WHERE id = ? AND (
+                ownerId = ?
+                OR ownerId IN (
+                    SELECT partner.sharedById FROM partner
+                    JOIN user ON user.id = partner.sharedById
+                    WHERE partner.sharedWithId = ? AND user.deletedAt IS NULL
+                )
+                OR EXISTS (
+                    SELECT 1 FROM album_asset
+                    JOIN album ON album.id = album_asset.albumId AND album.deletedAt IS NULL
+                    JOIN album_user ON album_user.albumId = album.id AND album_user.userId = ?
+                    WHERE album_asset.assetId = asset.id
+                )
+            )",
+        )
+        .bind(asset_id)
+        .bind(caller)
+        .bind(caller)
+        .bind(caller)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(match owner {
+            Some(owner) => Ok(owner),
+            None => Err(true),
+        })
+    }
+
+    pub(crate) async fn asset_ocr(&self, asset_id: &str) -> Result<Value, DbError> {
+        let rows: Vec<OcrRow> = sqlx::query_as(
+            "SELECT id, assetId AS asset_id, text, textScore AS text_score, boxScore AS box_score,
+                    x1, y1, x2, y2, x3, y3, x4, y4
+             FROM asset_ocr WHERE assetId = ? AND isVisible = 1
+             ORDER BY id",
+        )
+        .bind(asset_id)
+        .fetch_all(self.pool())
+        .await?;
+        let regions = rows
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "id": row.id,
+                    "assetId": row.asset_id,
+                    "text": row.text,
+                    "textScore": row.text_score,
+                    "boxScore": row.box_score,
+                    "x1": row.x1,
+                    "y1": row.y1,
+                    "x2": row.x2,
+                    "y2": row.y2,
+                    "x3": row.x3,
+                    "y3": row.y3,
+                    "x4": row.x4,
+                    "y4": row.y4,
+                })
+            })
+            .collect();
+        Ok(Value::Array(regions))
     }
 
     pub async fn update_asset(
@@ -1294,6 +1384,23 @@ fn jpeg_response(bytes: Vec<u8>, range_header: Option<&str>) -> axum::response::
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(CACHE));
     response
+}
+
+#[derive(sqlx::FromRow)]
+struct OcrRow {
+    id: String,
+    asset_id: String,
+    text: String,
+    text_score: f64,
+    box_score: f64,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    x3: f64,
+    y3: f64,
+    x4: f64,
+    y4: f64,
 }
 
 fn asset_json(record: &AssetRecord, stack: Option<Value>) -> Value {

@@ -351,7 +351,7 @@ async fn share_a_library_with_a_partner() {
     assert_eq!(status, 200, "{shared_by}");
     assert_eq!(shared_by[0]["id"], ada_id);
 
-    let hidden = bucket_ids(&app, &ada, "&withPartners=true").await;
+    let hidden = bucket_ids(&app, &ada, "&visibility=timeline&withPartners=true").await;
     assert!(hidden.contains(&ada_asset));
     assert!(!hidden.contains(&bob_asset));
 
@@ -402,7 +402,7 @@ async fn share_a_library_with_a_partner() {
     assert_eq!(status, 400);
     assert_eq!(json_body(&bytes)["message"], "Validation failed");
 
-    let visible = bucket_ids(&app, &ada, "&withPartners=true").await;
+    let visible = bucket_ids(&app, &ada, "&visibility=timeline&withPartners=true").await;
     assert!(visible.contains(&ada_asset));
     assert!(visible.contains(&bob_asset));
     let still_own = bucket_ids(&app, &ada, "&withPartners=false").await;
@@ -493,7 +493,7 @@ async fn share_a_library_with_a_partner() {
     assert_eq!(resumed[2]["data"]["id"], cam_new);
     ack(&app, &ada, &resumed).await;
 
-    let visible = bucket_ids(&app, &ada, "&withPartners=true").await;
+    let visible = bucket_ids(&app, &ada, "&visibility=timeline&withPartners=true").await;
     assert!(visible.contains(&bob_asset));
     assert!(!visible.contains(&cam_old));
 
