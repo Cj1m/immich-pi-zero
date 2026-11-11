@@ -2,15 +2,18 @@
 //! When the S3 variables are unset, the same calls write `{data}/objects` so tests need no bucket.
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::Response;
 use chrono::Utc;
+use futures_util::{Stream, StreamExt};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 
 use crate::config::{Config, S3Config};
@@ -30,7 +33,7 @@ impl std::fmt::Display for StoreError {
 
 pub enum Store {
     Local { root: PathBuf },
-    S3(S3Store),
+    S3(Box<S3Store>),
 }
 
 pub struct S3Store {
@@ -39,6 +42,8 @@ pub struct S3Store {
     host: String,
     origin: String,
     https: bool,
+    data_dir: PathBuf,
+    object_key: crate::seal::ObjectKey,
 }
 
 impl Store {
@@ -47,10 +52,19 @@ impl Store {
         std::fs::create_dir_all(&objects)?;
         std::fs::create_dir_all(config.data_dir.join("thumbs"))?;
         std::fs::create_dir_all(config.data_dir.join("tmp"))?;
+        std::fs::create_dir_all(config.data_dir.join("spool"))?;
         if let Some(s3) = &config.s3 {
-            return Ok(Self::S3(S3Store::new(s3.clone())?));
+            return Ok(Self::S3(Box::new(S3Store::new(
+                s3.clone(),
+                &config.data_dir,
+            )?)));
         }
         Ok(Self::Local { root: objects })
+    }
+
+    /// S3 originals are sealed and uploaded after the phone has its 201.
+    pub(crate) fn defers_upload(&self) -> bool {
+        matches!(self, Self::S3(_))
     }
 
     pub async fn put_file(
@@ -108,6 +122,32 @@ impl Store {
         Ok(Some(bytes.to_vec()))
     }
 
+    /// Copy one original onto `dest` as plaintext. Missing keys are `Ok(false)`.
+    /// A sealed S3 object is decrypted while it is copied. The local store is copied as-is.
+    pub async fn export_file(&self, key: &str, dest: &Path) -> Result<bool, StoreError> {
+        match self {
+            Self::Local { root } => {
+                let path = local_path(root, key)?;
+                if !path.is_file() {
+                    return Ok(false);
+                }
+                if path == dest {
+                    return Ok(true);
+                }
+                if let Some(parent) = dest.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|error| StoreError(error.to_string()))?;
+                }
+                tokio::fs::copy(&path, dest)
+                    .await
+                    .map_err(|error| StoreError(error.to_string()))?;
+                Ok(true)
+            }
+            Self::S3(store) => store.export_file(key, dest).await,
+        }
+    }
+
     /// Byte response for an Original. `range` is the raw Range header. Missing keys are `None`.
     pub async fn bytes_response(
         &self,
@@ -138,6 +178,25 @@ impl Store {
             }
         }
     }
+}
+
+pub(crate) async fn plain_file_response(
+    path: &Path,
+    range_header: Option<&str>,
+    content_type: &str,
+    filename: &str,
+) -> Result<Option<Response>, StoreError> {
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StoreError(error.to_string())),
+    };
+    let len = file
+        .metadata()
+        .await
+        .map_err(|error| StoreError(error.to_string()))?
+        .len();
+    file_response(file, len, range_header, content_type, filename).await
 }
 
 fn local_path(root: &Path, key: &str) -> Result<PathBuf, StoreError> {
@@ -299,7 +358,7 @@ pub fn parse_range(header: &str, len: u64) -> Option<(u64, u64)> {
 }
 
 impl S3Store {
-    fn new(config: S3Config) -> Result<Self, std::io::Error> {
+    fn new(config: S3Config, data_dir: &Path) -> Result<Self, std::io::Error> {
         let (https, host, origin) = split_endpoint(&config.endpoint)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         let client = reqwest::Client::builder()
@@ -307,12 +366,15 @@ impl S3Store {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(std::io::Error::other)?;
+        let object_key = crate::seal::ObjectKey::load_or_create(&data_dir.join("keys"))?;
         Ok(Self {
             config,
             client,
             host,
             origin,
             https,
+            data_dir: data_dir.to_path_buf(),
+            object_key,
         })
     }
 
@@ -381,8 +443,34 @@ impl S3Store {
         )
     }
 
-    async fn put_file(&self, key: &str, path: &Path, content_type: &str) -> Result<(), StoreError> {
-        let file = tokio::fs::File::open(path)
+    async fn put_file(
+        &self,
+        key: &str,
+        path: &Path,
+        _content_type: &str,
+    ) -> Result<(), StoreError> {
+        let plain_len = tokio::fs::metadata(path)
+            .await
+            .map_err(|error| StoreError(error.to_string()))?
+            .len();
+        let sealed_path = self
+            .data_dir
+            .join("tmp")
+            .join(format!("seal-{}", uuid::Uuid::new_v4()));
+        if let Some(parent) = sealed_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| StoreError(error.to_string()))?;
+        }
+        let object_key = self.object_key.clone();
+        let source = path.to_path_buf();
+        let destination = sealed_path.clone();
+        tokio::task::spawn_blocking(move || object_key.seal_file(&source, &destination))
+            .await
+            .map_err(|error| StoreError(error.to_string()))?
+            .map_err(|error| StoreError(error.to_string()))?;
+        let guard = DeletePath(sealed_path);
+        let file = tokio::fs::File::open(&guard.0)
             .await
             .map_err(|error| StoreError(error.to_string()))?;
         let len = file
@@ -401,7 +489,7 @@ impl S3Store {
             .header("x-amz-date", &amz_date)
             .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
             .header(header::AUTHORIZATION, authorization)
-            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
             .header(header::CONTENT_LENGTH, len)
             .body(reqwest::Body::wrap_stream(ReaderStream::new(file)))
             .send()
@@ -412,6 +500,7 @@ impl S3Store {
             let body = response.text().await.unwrap_or_default();
             return Err(StoreError(format!("s3 put {status}: {body}")));
         }
+        eprintln!("sealed {key} ({plain_len} bytes)");
         Ok(())
     }
 
@@ -448,6 +537,110 @@ impl S3Store {
         let Some(len) = head else {
             return Ok(None);
         };
+        if len >= crate::seal::HEADER_LEN as u64 {
+            let header = self
+                .read_range(key, 0, crate::seal::HEADER_LEN as u64 - 1)
+                .await?;
+            if crate::seal::looks_sealed(&header) {
+                return self
+                    .sealed_response(key, len, &header, range_header, content_type, filename)
+                    .await;
+            }
+        }
+        self.plain_response(key, len, range_header, content_type, filename)
+            .await
+    }
+
+    async fn export_file(&self, key: &str, dest: &Path) -> Result<bool, StoreError> {
+        let Some(len) = self.head(key).await? else {
+            return Ok(false);
+        };
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| StoreError(error.to_string()))?;
+        }
+        let copied = self.export_body(key, len, dest).await;
+        if copied.is_err() {
+            let _ = tokio::fs::remove_file(dest).await;
+        }
+        copied.map(|()| true)
+    }
+
+    async fn export_body(&self, key: &str, len: u64, dest: &Path) -> Result<(), StoreError> {
+        if len >= crate::seal::HEADER_LEN as u64 {
+            let header = self
+                .read_range(key, 0, crate::seal::HEADER_LEN as u64 - 1)
+                .await?;
+            if crate::seal::looks_sealed(&header) {
+                let opened = self
+                    .object_key
+                    .open_header(&header)
+                    .map_err(|error| StoreError(error.0))?;
+                let expected = crate::seal::sealed_len(opened.plain_len, opened.chunk_size)
+                    .ok_or_else(|| StoreError("sealed object length overflow".to_string()))?;
+                if len != expected {
+                    return Err(StoreError(format!(
+                        "sealed object {key} is {len} bytes, header says {expected}"
+                    )));
+                }
+                if opened.plain_len == 0 {
+                    tokio::fs::write(dest, [])
+                        .await
+                        .map_err(|error| StoreError(error.to_string()))?;
+                    return Ok(());
+                }
+                return self
+                    .write_plain(key, &opened, 0, opened.plain_len - 1, dest)
+                    .await;
+            }
+        }
+        self.download_plain(key, dest).await
+    }
+
+    async fn download_plain(&self, key: &str, dest: &Path) -> Result<(), StoreError> {
+        let amz_date = amz_now();
+        let uri = self.canonical_uri(key);
+        let authorization = self.authorization("GET", &uri, EMPTY_SHA256, &amz_date);
+        let response = self
+            .client
+            .get(self.object_url(key))
+            .header(header::HOST, self.request_host())
+            .header("x-amz-date", &amz_date)
+            .header("x-amz-content-sha256", EMPTY_SHA256)
+            .header(header::AUTHORIZATION, authorization)
+            .send()
+            .await
+            .map_err(|error| StoreError(error.to_string()))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(StoreError(format!("s3 get {status}: {body}")));
+        }
+        let mut file = tokio::fs::File::create(dest)
+            .await
+            .map_err(|error| StoreError(error.to_string()))?;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| StoreError(error.to_string()))?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| StoreError(error.to_string()))?;
+        }
+        file.flush()
+            .await
+            .map_err(|error| StoreError(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn plain_response(
+        &self,
+        key: &str,
+        len: u64,
+        range_header: Option<&str>,
+        content_type: &str,
+        filename: &str,
+    ) -> Result<Option<Response>, StoreError> {
         let (status, start, end) = match range_header {
             Some(header) => match parse_range(header, len) {
                 Some((start, end)) => (StatusCode::PARTIAL_CONTENT, start, end),
@@ -532,6 +725,242 @@ impl S3Store {
             .and_then(|value| value.parse().ok())
             .unwrap_or(0);
         Ok(Some(len))
+    }
+
+    async fn sealed_response(
+        &self,
+        key: &str,
+        cipher_len: u64,
+        header: &[u8],
+        range_header: Option<&str>,
+        content_type: &str,
+        filename: &str,
+    ) -> Result<Option<Response>, StoreError> {
+        let opened = self
+            .object_key
+            .open_header(header)
+            .map_err(|error| StoreError(error.0))?;
+        let expected = crate::seal::sealed_len(opened.plain_len, opened.chunk_size)
+            .ok_or_else(|| StoreError("sealed object length overflow".to_string()))?;
+        if cipher_len != expected {
+            return Err(StoreError(format!(
+                "sealed object {key} is {cipher_len} bytes, header says {expected}"
+            )));
+        }
+        let (status, start, end) = match range_header {
+            Some(header) => match parse_range(header, opened.plain_len) {
+                Some((start, end)) => (StatusCode::PARTIAL_CONTENT, start, end),
+                None => return Ok(Some(range_not_satisfiable(opened.plain_len))),
+            },
+            None => {
+                if opened.plain_len == 0 {
+                    (StatusCode::OK, 0, 0)
+                } else {
+                    (StatusCode::OK, 0, opened.plain_len - 1)
+                }
+            }
+        };
+        let slice_len = if opened.plain_len == 0 {
+            0
+        } else {
+            end - start + 1
+        };
+        let body = if slice_len == 0 {
+            Body::empty()
+        } else {
+            let temp = self
+                .data_dir
+                .join("tmp")
+                .join(format!("open-{}", uuid::Uuid::new_v4()));
+            if let Some(parent) = temp.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|error| StoreError(error.to_string()))?;
+            }
+            if let Err(error) = self.write_plain(key, &opened, start, end, &temp).await {
+                let _ = tokio::fs::remove_file(&temp).await;
+                return Err(error);
+            }
+            let file = tokio::fs::File::open(&temp)
+                .await
+                .map_err(|error| StoreError(error.to_string()))?;
+            Body::from_stream(ReaderStream::new(
+                TempBody { file, path: temp }.take(slice_len),
+            ))
+        };
+        Ok(Some(build_response(
+            body,
+            ObjectSlice {
+                status,
+                slice_len,
+                total: opened.plain_len,
+                partial: range_header.is_some(),
+                start,
+                end,
+            },
+            content_type,
+            filename,
+        )))
+    }
+
+    async fn write_plain(
+        &self,
+        key: &str,
+        opened: &crate::seal::Opened,
+        start: u64,
+        end: u64,
+        dest: &Path,
+    ) -> Result<(), StoreError> {
+        let chunk = u64::from(opened.chunk_size);
+        let first = start / chunk;
+        let last = end / chunk;
+        let cipher_start = crate::seal::chunk_offset(opened.chunk_size, first)
+            .map_err(|error| StoreError(error.0))?;
+        let last_plain = crate::seal::chunk_plain_len(opened.plain_len, opened.chunk_size, last)
+            .map_err(|error| StoreError(error.0))?;
+        let last_offset = crate::seal::chunk_offset(opened.chunk_size, last)
+            .map_err(|error| StoreError(error.0))?;
+        let cipher_end = last_offset + last_plain + 16 - 1;
+        let response = self.open_range(key, cipher_start, cipher_end).await?;
+        let mut pump = BytePump::new(response);
+        let mut file = tokio::fs::File::create(dest)
+            .await
+            .map_err(|error| StoreError(error.to_string()))?;
+        for index in first..=last {
+            let plain_len =
+                crate::seal::chunk_plain_len(opened.plain_len, opened.chunk_size, index)
+                    .map_err(|error| StoreError(error.0))?;
+            let wire = pump.read_exact((plain_len + 16) as usize).await?;
+            let plain = opened
+                .decrypt_chunk(index, &wire)
+                .map_err(|error| StoreError(error.0))?;
+            let piece = crate::seal::overlap(index, opened.chunk_size, start, end, &plain);
+            file.write_all(piece)
+                .await
+                .map_err(|error| StoreError(error.to_string()))?;
+        }
+        file.flush()
+            .await
+            .map_err(|error| StoreError(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn read_range(
+        &self,
+        key: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<Vec<u8>, StoreError> {
+        let response = self.open_range(key, start, end_inclusive).await?;
+        let mut pump = BytePump::new(response);
+        let count = (end_inclusive - start + 1) as usize;
+        pump.read_exact(count).await
+    }
+
+    async fn open_range(
+        &self,
+        key: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<reqwest::Response, StoreError> {
+        let amz_date = amz_now();
+        let uri = self.canonical_uri(key);
+        let authorization = self.authorization("GET", &uri, EMPTY_SHA256, &amz_date);
+        let response = self
+            .client
+            .get(self.object_url(key))
+            .header(header::HOST, self.request_host())
+            .header("x-amz-date", &amz_date)
+            .header("x-amz-content-sha256", EMPTY_SHA256)
+            .header(header::AUTHORIZATION, authorization)
+            .header(header::RANGE, format!("bytes={start}-{end_inclusive}"))
+            .send()
+            .await
+            .map_err(|error| StoreError(error.to_string()))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(StoreError(format!("s3 get {key} returned 404")));
+        }
+        if !response.status().is_success() && response.status().as_u16() != 206 {
+            let status_code = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(StoreError(format!("s3 get {status_code}: {body}")));
+        }
+        Ok(response)
+    }
+}
+
+struct DeletePath(PathBuf);
+
+impl Drop for DeletePath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+struct TempBody {
+    file: tokio::fs::File,
+    path: PathBuf,
+}
+
+impl Drop for TempBody {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl AsyncRead for TempBody {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().file).poll_read(cx, buf)
+    }
+}
+
+struct BytePump {
+    stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>> + Send>>,
+    pending: Vec<u8>,
+    pending_pos: usize,
+}
+
+impl BytePump {
+    fn new(response: reqwest::Response) -> Self {
+        let stream = response.bytes_stream().map(|item| {
+            item.map(|chunk| chunk.as_ref().to_vec())
+                .map_err(|error| error.to_string())
+        });
+        Self {
+            stream: Box::pin(stream),
+            pending: Vec::new(),
+            pending_pos: 0,
+        }
+    }
+
+    async fn read_exact(&mut self, count: usize) -> Result<Vec<u8>, StoreError> {
+        let mut out = vec![0u8; count];
+        let mut filled = 0;
+        while filled < count {
+            if self.pending_pos >= self.pending.len() {
+                match self.stream.as_mut().next().await {
+                    Some(Ok(chunk)) => {
+                        self.pending = chunk;
+                        self.pending_pos = 0;
+                    }
+                    Some(Err(error)) => return Err(StoreError(error)),
+                    None => return Err(StoreError("sealed object ended early".to_string())),
+                }
+                if self.pending.is_empty() {
+                    continue;
+                }
+            }
+            let take = (count - filled).min(self.pending.len() - self.pending_pos);
+            out[filled..filled + take]
+                .copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + take]);
+            self.pending_pos += take;
+            filled += take;
+        }
+        Ok(out)
     }
 }
 

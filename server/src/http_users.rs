@@ -1,12 +1,14 @@
 //! Admin user list, the new-user screen, both password calls, and web onboarding.
 
+use std::time::Duration;
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::db::App;
 use crate::http::{db_error, json_ok, message, require_session, user_json};
@@ -242,6 +244,10 @@ async fn serve_socket(app: App, user_id: String, mut socket: WebSocket) {
     }
     let mut events = app.subscribe_events(&user_id);
     let mut ready = false;
+    // engine.io-client resets its liveness timer only when the server sends ping `2`.
+    let mut ping = tokio::time::interval(Duration::from_secs(25));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await;
     loop {
         tokio::select! {
             incoming = socket.recv() => {
@@ -253,7 +259,19 @@ async fn serve_socket(app: App, user_id: String, mut socket: WebSocket) {
                             }
                         } else if text.as_str().starts_with("40") {
                             ready = true;
-                            if socket.send(Message::Text("40".into())).await.is_err() {
+                            // socket.io-client 4.x treats a bare "40" as a v2 server and stays disconnected.
+                            let ack = format!("40{}", json!({ "sid": crate::db::new_id() }));
+                            if socket.send(Message::Text(ack.into())).await.is_err() {
+                                break;
+                            }
+                            let version = format!(
+                                "42{}",
+                                json!([
+                                    "on_server_version",
+                                    { "major": 3, "minor": 3, "patch": 6, "prerelease": null }
+                                ])
+                            );
+                            if socket.send(Message::Text(version.into())).await.is_err() {
                                 break;
                             }
                         }
@@ -265,6 +283,11 @@ async fn serve_socket(app: App, user_id: String, mut socket: WebSocket) {
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                     _ => {}
+                }
+            }
+            _ = ping.tick() => {
+                if socket.send(Message::Text("2".into())).await.is_err() {
+                    break;
                 }
             }
             packet = events.recv() => {

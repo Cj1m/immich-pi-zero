@@ -66,6 +66,26 @@ fn json_body(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).unwrap_or(Value::Null)
 }
 
+fn assert_human_bytes(value: &Value, raw: u64) {
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    let mut magnitude = 0usize;
+    let mut remainder = raw as f64;
+    while remainder >= 1024.0 {
+        if magnitude + 1 < UNITS.len() {
+            magnitude += 1;
+            remainder /= 1024.0;
+        } else {
+            break;
+        }
+    }
+    let label = if magnitude == 0 {
+        format!("{remainder:.0} {}", UNITS[magnitude])
+    } else {
+        format!("{remainder:.1} {}", UNITS[magnitude])
+    };
+    assert_eq!(value.as_str(), Some(label.as_str()), "{raw}");
+}
+
 async fn login(
     app: &App,
     email: &str,
@@ -131,14 +151,14 @@ async fn admin_creates_a_later_user() {
     assert_eq!(status, 200, "{storage}");
     let total = storage["diskSizeRaw"].as_u64().expect("disk size");
     assert!(total > 0, "{storage}");
-    assert_eq!(storage["diskSize"], total.to_string());
-    assert_eq!(
-        storage["diskUse"],
-        storage["diskUseRaw"].as_u64().unwrap().to_string()
+    assert_human_bytes(&storage["diskSize"], total);
+    assert_human_bytes(
+        &storage["diskUse"],
+        storage["diskUseRaw"].as_u64().unwrap(),
     );
-    assert_eq!(
-        storage["diskAvailable"],
-        storage["diskAvailableRaw"].as_u64().unwrap().to_string()
+    assert_human_bytes(
+        &storage["diskAvailable"],
+        storage["diskAvailableRaw"].as_u64().unwrap(),
     );
     assert!(storage["diskUsagePercentage"].is_number());
 
@@ -1237,7 +1257,12 @@ async fn admin_updates_deletes_and_restores_a_user() {
         .await
         .unwrap();
     let connected = next_text(&mut socket).await;
-    assert_eq!(connected, "40");
+    assert!(connected.starts_with("40{"), "{connected}");
+    assert!(connected.contains("\"sid\""), "{connected}");
+    let version = next_text(&mut socket).await;
+    assert!(version.contains("on_server_version"), "{version}");
+    assert!(version.contains("\"major\":3"), "{version}");
+    assert!(version.contains("\"patch\":6"), "{version}");
 
     let (status, body) = call(
         &app,

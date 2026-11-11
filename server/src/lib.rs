@@ -43,11 +43,14 @@ mod plugins;
 mod shares;
 mod workflows;
 mod clusters;
+mod seal;
+mod spool;
 mod store;
 mod sync;
 mod system_config;
 mod tags;
 mod thumbs;
+mod vision;
 mod users;
 mod web;
 
@@ -71,6 +74,14 @@ pub fn run() -> Result<(), StartupError> {
         let jobs = app.clone();
         tokio::spawn(async move {
             memories::nightly_loop(jobs).await;
+        });
+        let resume = app.clone();
+        tokio::spawn(async move {
+            resume.resume_spooled_uploads().await;
+        });
+        let pending = app.clone();
+        tokio::spawn(async move {
+            crate::vision::run_pending(&pending).await;
         });
         let address = SocketAddr::new(config.host, config.port);
         let listener = tokio::net::TcpListener::bind(address)

@@ -5,11 +5,13 @@ edition = "2021"
 publish = false
 
 [dependencies]
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 axum = { version = "0.8", features = ["multipart", "ws"] }
 base64 = "0.22"
 bcrypt = "0.17"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 extism = "=1.10.0"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 getrandom = "0.3"
 hex = "0.4"
 hmac = "0.12"

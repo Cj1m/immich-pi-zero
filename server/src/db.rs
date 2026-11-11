@@ -26,6 +26,8 @@ pub struct App {
     config_file_locked: bool,
     log_level_locked: bool,
     events: LiveEvents,
+    /// One background seal-and-PUT at a time. The upload response does not take this lock.
+    upload_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl App {
@@ -59,6 +61,10 @@ impl App {
 
     pub(crate) fn log_level_locked(&self) -> bool {
         self.log_level_locked
+    }
+
+    pub(crate) fn upload_gate(&self) -> &tokio::sync::Mutex<()> {
+        &self.upload_gate
     }
 
     pub(crate) async fn quota_size(&self, user_id: &str) -> Result<Option<i64>, DbError> {
@@ -107,6 +113,7 @@ impl App {
             config_file_locked: config.config_file.is_some(),
             log_level_locked: config.log_level.is_some(),
             events: LiveEvents::new(),
+            upload_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         };
         if let Err(error) = crate::ml::discard_mismatched_clip(&app).await {
             eprintln!("clip: {error}");
@@ -928,6 +935,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StartupError> {
             .map_err(StartupError::Database)?;
         transaction.commit().await.map_err(StartupError::Database)?;
     }
+    if current < 20 {
+        let mut transaction = pool.begin().await.map_err(StartupError::Database)?;
+        for statement in SCHEMA_V20.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StartupError::Database)?;
+        }
+        sqlx::query("INSERT INTO schema_migration (version) VALUES (20)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(StartupError::Database)?;
+        transaction.commit().await.map_err(StartupError::Database)?;
+    }
     Ok(())
 }
 
@@ -1576,6 +1601,13 @@ CREATE TABLE asset_edit_audit (
     deletedAt TEXT NOT NULL
 );
 CREATE INDEX asset_edit_audit_id ON asset_edit_audit(id);
+";
+
+const SCHEMA_V20: &str = "
+CREATE TABLE face_search (
+    faceId TEXT PRIMARY KEY NOT NULL REFERENCES asset_face(id) ON DELETE CASCADE,
+    embedding BLOB NOT NULL
+);
 ";
 
 struct LiveSocket {

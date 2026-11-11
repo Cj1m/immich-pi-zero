@@ -903,10 +903,19 @@ impl App {
             };
             let bytes = match edited_bytes {
                 Some(bytes) => bytes,
-                None => match self.store().read_file(&row.original_path).await? {
-                    Some(bytes) => bytes,
-                    None => continue,
-                },
+                None => {
+                    let spool = crate::spool::original_file(self.data_dir(), asset_id);
+                    if spool.is_file() {
+                        tokio::fs::read(&spool)
+                            .await
+                            .map_err(|error| DbError::Store(error.to_string()))?
+                    } else {
+                        match self.store().read_file(&row.original_path).await? {
+                            Some(bytes) => bytes,
+                            None => continue,
+                        }
+                    }
+                }
             };
             let filename = unique_name(&mut names, &sanitize_name(&row.original_file_name));
             entries.push((filename, bytes));

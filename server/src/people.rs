@@ -1,5 +1,5 @@
 //! People the web page lists. A person with no visible timeline face stays off the list.
-//! Merge and face moves use rows that already exist. Nothing here detects a face.
+//! Merge and face moves use rows that already exist. Detection lives in `vision`.
 
 use chrono::{NaiveDate, Utc};
 use http::StatusCode;
@@ -1124,7 +1124,7 @@ impl App {
         Ok(())
     }
 
-    async fn refresh_feature_face(
+    pub(crate) async fn refresh_feature_face(
         &self,
         user_id: &str,
         person_id: &str,

@@ -8,6 +8,9 @@ use crate::db::{new_id, new_update_id, now_iso, App, DbError};
 use crate::exif_meta::{self, ExifMeta};
 use crate::thumbs::{self, ThumbFiles};
 
+/// How long an upload will wait for a poster before answering the phone.
+const POSTER_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
 const ASSET_SQL: &str = "SELECT
     asset.id AS id,
     asset.ownerId AS owner_id,
@@ -195,6 +198,11 @@ impl App {
         let asset_id = new_id();
         let key = format!("{owner_id}/{asset_id}/original");
         let (asset_type, mime) = classify_filename(&file.filename);
+        if self.store().defers_upload() {
+            return self
+                .ingest_deferred(owner_id, file, asset_id, key, asset_type, mime)
+                .await;
+        }
         let (thumbs, exif) =
             generate_thumbs(self.data_dir(), &asset_id, &file.temp_path, asset_type).await;
         let sidecar_key = file.sidecar_temp.as_ref().map(|_| format!("{key}.xmp"));
@@ -215,30 +223,20 @@ impl App {
             }
         }
 
-        let now = now_iso();
-        let update_id = new_update_id();
-        let (width, height, exif_width, exif_height) = image_dimensions(&thumbs, &exif);
-        let insert = insert_asset(
-            self,
-            &asset_id,
-            owner_id,
-            asset_type,
-            &key,
-            &file.filename,
-            mime,
-            file,
-            &update_id,
-            &now,
-            width,
-            height,
-            exif_width,
-            exif_height,
-            &exif,
-            sidecar_key.as_deref(),
-            thumbs.as_ref(),
-        )
-        .await;
-        if let Err(error) = insert {
+        if let Err(error) = self
+            .commit_original(
+                owner_id,
+                &asset_id,
+                asset_type,
+                &key,
+                mime,
+                file,
+                &thumbs,
+                &exif,
+                sidecar_key.as_deref(),
+            )
+            .await
+        {
             let _ = self.store().delete(&key).await;
             if let Some(sidecar_key) = &sidecar_key {
                 let _ = self.store().delete(sidecar_key).await;
@@ -251,23 +249,255 @@ impl App {
             }
             return Err(error);
         }
+        Ok(IngestResult::Created(asset_id))
+    }
+
+    /// The phone has 60 seconds to see a reply after the body arrives. Keep the bytes on the Pi,
+    /// answer, then seal and PUT. A poster that is still running is stored by the background task.
+    async fn ingest_deferred(
+        &self,
+        owner_id: &str,
+        file: &IncomingOriginal,
+        asset_id: String,
+        key: String,
+        asset_type: &str,
+        mime: &str,
+    ) -> Result<IngestResult, DbError> {
+        let original = crate::spool::original_file(self.data_dir(), &asset_id);
+        if let Err(error) = crate::spool::move_file(&file.temp_path, &original).await {
+            crate::spool::remove_directory(self.data_dir(), &asset_id);
+            return Err(error);
+        }
+        if let Some(sidecar) = &file.sidecar_temp {
+            let dest = crate::spool::sidecar_file(self.data_dir(), &asset_id);
+            if let Err(error) = crate::spool::move_file(sidecar, &dest).await {
+                crate::spool::remove_directory(self.data_dir(), &asset_id);
+                return Err(error);
+            }
+        }
+
+        let data_dir = self.data_dir().to_path_buf();
+        let thumb_id = asset_id.clone();
+        let source = original.clone();
+        let kind = asset_type.to_string();
+        let mut thumbs_job = tokio::spawn(async move {
+            generate_thumbs(&data_dir, &thumb_id, &source, &kind).await
+        });
+        let ready = tokio::select! {
+            biased;
+            result = &mut thumbs_job => match result {
+                Ok(pair) => Some(pair),
+                Err(_) => Some((None, ExifMeta::default())),
+            },
+            _ = tokio::time::sleep(POSTER_WAIT) => None,
+        };
+        let pending_thumbs = ready.is_none();
+        let (thumbs, exif) = ready.unwrap_or_else(|| (None, ExifMeta::default()));
+        let sidecar_key = file.sidecar_temp.as_ref().map(|_| format!("{key}.xmp"));
+        if let Err(error) = self
+            .commit_original(
+                owner_id,
+                &asset_id,
+                asset_type,
+                &key,
+                mime,
+                file,
+                &thumbs,
+                &exif,
+                sidecar_key.as_deref(),
+            )
+            .await
+        {
+            crate::spool::remove_directory(self.data_dir(), &asset_id);
+            thumbs::remove_thumbs(self.data_dir(), &asset_id);
+            if is_unique(&error) {
+                if let Some(existing) = self.find_by_checksum(owner_id, &file.checksum).await? {
+                    return Ok(IngestResult::Duplicate(existing));
+                }
+            }
+            return Err(error);
+        }
+
+        let app = self.clone();
+        let background_id = asset_id.clone();
+        let asset_type = asset_type.to_string();
+        let visibility = file.visibility.clone();
+        if pending_thumbs {
+            tokio::spawn(async move {
+                if let Ok((late, _)) = thumbs_job.await {
+                    if let Some(late) = late.as_ref() {
+                        store_late_thumbs(&app, &background_id, &asset_type, &visibility, late)
+                            .await;
+                    }
+                }
+                app.finish_spooled_upload(background_id).await;
+            });
+        } else {
+            drop(thumbs_job);
+            tokio::spawn(async move {
+                app.finish_spooled_upload(background_id).await;
+            });
+        }
+        Ok(IngestResult::Created(asset_id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_original(
+        &self,
+        owner_id: &str,
+        asset_id: &str,
+        asset_type: &str,
+        key: &str,
+        mime: &str,
+        file: &IncomingOriginal,
+        thumbs: &Option<ThumbFiles>,
+        exif: &ExifMeta,
+        sidecar_key: Option<&str>,
+    ) -> Result<(), DbError> {
+        let now = now_iso();
+        let update_id = new_update_id();
+        let (width, height, exif_width, exif_height) = image_dimensions(thumbs, exif);
+        insert_asset(
+            self,
+            asset_id,
+            owner_id,
+            asset_type,
+            key,
+            &file.filename,
+            mime,
+            file,
+            &update_id,
+            &now,
+            width,
+            height,
+            exif_width,
+            exif_height,
+            exif,
+            sidecar_key,
+            thumbs.as_ref(),
+        )
+        .await?;
         if asset_type == "IMAGE" && thumbs.is_some() && file.visibility != "hidden" {
             let preview = self
                 .data_dir()
                 .join("thumbs")
-                .join(&asset_id)
+                .join(asset_id)
                 .join("preview.jpg");
-            if let Err(error) = crate::ml::encode_asset_clip(self, &asset_id, &preview).await {
+            if let Err(error) = crate::ml::encode_asset_clip(self, asset_id, &preview).await {
                 eprintln!("clip encode: {error}");
-            } else if let Err(error) = self.detect_duplicates(&asset_id, false).await {
+            } else if let Err(error) = self.detect_duplicates(asset_id, false).await {
                 eprintln!("duplicate detection: {error:?}");
             }
         }
-        self.run_asset_workflows(owner_id, &asset_id, "AssetCreate")
+        self.run_asset_workflows(owner_id, asset_id, "AssetCreate")
             .await;
-        self.run_asset_workflows(owner_id, &asset_id, "AssetMetadataExtraction")
+        self.run_asset_workflows(owner_id, asset_id, "AssetMetadataExtraction")
             .await;
-        Ok(IngestResult::Created(asset_id))
+        Ok(())
+    }
+
+    /// Upload every spooled original that still has an asset row. Orphan directories are removed.
+    pub async fn resume_spooled_uploads(&self) {
+        let root = self.data_dir().join("spool");
+        let mut dir = match tokio::fs::read_dir(&root).await {
+            Ok(dir) => dir,
+            Err(_) => return,
+        };
+        let mut ids = Vec::new();
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if uuid::Uuid::parse_str(&name).is_err()
+                || !crate::spool::original_file(self.data_dir(), &name).is_file()
+            {
+                let _ = tokio::fs::remove_dir_all(entry.path()).await;
+                continue;
+            }
+            match self.asset_by_id(&name).await {
+                Ok(Some(_)) => ids.push(name),
+                Ok(None) => crate::spool::remove_directory(self.data_dir(), &name),
+                Err(error) => eprintln!("spool resume {name}: {error:?}"),
+            }
+        }
+        for id in ids {
+            self.finish_spooled_upload(id).await;
+        }
+    }
+
+    async fn finish_spooled_upload(&self, asset_id: String) {
+        if let Ok(Some(record)) = self.asset_by_id(&asset_id).await {
+            if self
+                .thumb_file(&asset_id, "thumbnail")
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                let _ = self.ensure_thumbs(&record).await;
+            }
+        }
+        let mut delay = std::time::Duration::from_secs(2);
+        loop {
+            let _guard = self.upload_gate().lock().await;
+            let record = match self.asset_by_id(&asset_id).await {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    crate::spool::remove_directory(self.data_dir(), &asset_id);
+                    return;
+                }
+                Err(error) => {
+                    drop(_guard);
+                    eprintln!("spool upload {asset_id}: {error:?}");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                    continue;
+                }
+            };
+            let original = crate::spool::original_file(self.data_dir(), &asset_id);
+            if !original.is_file() {
+                return;
+            }
+            if let Err(error) = self
+                .store()
+                .put_file(&record.original_path, &original, &record.original_mime_type)
+                .await
+            {
+                drop(_guard);
+                eprintln!("spool upload {asset_id}: {error}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                continue;
+            }
+            let sidecar = crate::spool::sidecar_file(self.data_dir(), &asset_id);
+            if sidecar.is_file() {
+                let sidecar_key = format!("{}.xmp", record.original_path);
+                if let Err(error) = self
+                    .store()
+                    .put_file(&sidecar_key, &sidecar, "application/xml")
+                    .await
+                {
+                    drop(_guard);
+                    eprintln!("spool sidecar {asset_id}: {error}");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                    continue;
+                }
+            }
+            if self
+                .asset_by_id(&asset_id)
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                let _ = self.store().delete(&record.original_path).await;
+                let _ = self
+                    .store()
+                    .delete(&format!("{}.xmp", record.original_path))
+                    .await;
+            }
+            crate::spool::remove_directory(self.data_dir(), &asset_id);
+            return;
+        }
     }
 
     pub(crate) async fn asset_visibility(
@@ -683,12 +913,7 @@ impl App {
                 let Ok(record) = self.asset_record(owner_id, id).await else {
                     continue;
                 };
-                let source = self.data_dir().join("objects").join(&record.original_path);
-                if source.is_file() {
-                    let _ =
-                        generate_thumbs(self.data_dir(), &record.id, &source, &record.asset_type)
-                            .await;
-                }
+                let _ = self.ensure_thumbs(&record).await;
             }
         }
         Ok(())
@@ -749,6 +974,17 @@ impl App {
         range_header: Option<&str>,
     ) -> Result<axum::response::Response, DbError> {
         let record = self.asset_record(owner_id, id).await?;
+        let spool = crate::spool::original_file(self.data_dir(), id);
+        if spool.is_file() {
+            let response = crate::store::plain_file_response(
+                &spool,
+                range_header,
+                &record.original_mime_type,
+                &record.original_file_name,
+            )
+            .await?;
+            return response.ok_or(DbError::NotFound);
+        }
         let response = self
             .store()
             .bytes_response(
@@ -786,16 +1022,9 @@ impl App {
         } else if let Some(path) = self.thumb_file(&record.id, file_type).await? {
             path
         } else {
-            let source = self.data_dir().join("objects").join(&record.original_path);
-            if !source.is_file() {
+            if self.ensure_thumbs(&record).await?.is_none() {
                 return Err(DbError::NotFound);
             }
-            let (thumbs, _) =
-                generate_thumbs(self.data_dir(), &record.id, &source, &record.asset_type).await;
-            let Some(thumbs) = thumbs else {
-                return Err(DbError::NotFound);
-            };
-            self.store_thumb_rows(&record.id, &thumbs).await?;
             if file_type == "preview" {
                 format!("thumbs/{}/preview.jpg", record.id)
             } else {
@@ -807,6 +1036,59 @@ impl App {
             .await
             .map_err(|_| DbError::NotFound)?;
         Ok(jpeg_response(bytes, range_header))
+    }
+
+    /// Write the local JPEG poster when it is missing. An S3 original is decrypted to a temp file first.
+    async fn ensure_thumbs(&self, record: &AssetRecord) -> Result<Option<ThumbFiles>, DbError> {
+        let Some(source) = self.plain_original(&record.original_path).await? else {
+            return Ok(None);
+        };
+        let (thumbs, _) =
+            generate_thumbs(self.data_dir(), &record.id, source.path(), &record.asset_type).await;
+        drop(source);
+        if let Some(thumbs) = &thumbs {
+            self.store_thumb_rows(&record.id, thumbs).await?;
+        }
+        Ok(thumbs)
+    }
+
+    async fn plain_original(&self, key: &str) -> Result<Option<PlainOriginal>, DbError> {
+        if let Some(asset_id) = crate::spool::id_from_original_key(key) {
+            let spool = crate::spool::original_file(self.data_dir(), asset_id);
+            if spool.is_file() {
+                return Ok(Some(PlainOriginal {
+                    path: spool,
+                    remove_on_drop: false,
+                }));
+            }
+        }
+        let local = self.data_dir().join("objects").join(key);
+        if local.is_file() {
+            return Ok(Some(PlainOriginal {
+                path: local,
+                remove_on_drop: false,
+            }));
+        }
+        let path = self
+            .data_dir()
+            .join("tmp")
+            .join(format!("frame-{}", new_id()));
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| DbError::Store(error.to_string()))?;
+        }
+        match self.store().export_file(key, &path).await {
+            Ok(true) => Ok(Some(PlainOriginal {
+                path,
+                remove_on_drop: true,
+            })),
+            Ok(false) => Ok(None),
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                Err(error.into())
+            }
+        }
     }
 
     async fn thumb_file(&self, asset_id: &str, kind: &str) -> Result<Option<String>, DbError> {
@@ -1095,6 +1377,7 @@ impl App {
             .store()
             .delete(&format!("{}.xmp", record.original_path))
             .await;
+        crate::spool::remove_directory(self.data_dir(), id);
         thumbs::remove_thumbs(self.data_dir(), id);
         if let Some(size) = record.file_size {
             sqlx::query(
@@ -1290,6 +1573,25 @@ async fn insert_asset(
     Ok(())
 }
 
+struct PlainOriginal {
+    path: std::path::PathBuf,
+    remove_on_drop: bool,
+}
+
+impl PlainOriginal {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for PlainOriginal {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn image_dimensions(
     thumbs: &Option<ThumbFiles>,
     exif: &ExifMeta,
@@ -1304,6 +1606,30 @@ fn image_dimensions(
         None => (raw_width, raw_height),
     };
     (width, height, raw_width, raw_height)
+}
+
+async fn store_late_thumbs(
+    app: &App,
+    asset_id: &str,
+    asset_type: &str,
+    visibility: &str,
+    thumbs: &ThumbFiles,
+) {
+    if app.store_thumb_rows(asset_id, thumbs).await.is_err() {
+        return;
+    }
+    if asset_type == "IMAGE" && visibility != "hidden" {
+        let preview = app
+            .data_dir()
+            .join("thumbs")
+            .join(asset_id)
+            .join("preview.jpg");
+        if let Err(error) = crate::ml::encode_asset_clip(app, asset_id, &preview).await {
+            eprintln!("clip encode: {error}");
+        } else if let Err(error) = app.detect_duplicates(asset_id, false).await {
+            eprintln!("duplicate detection: {error:?}");
+        }
+    }
 }
 
 async fn generate_thumbs(

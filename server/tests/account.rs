@@ -171,7 +171,13 @@ async fn connect_socket(addr: std::net::SocketAddr, cookie: &str) -> Socket {
         .send(tokio_tungstenite::tungstenite::Message::Text("40".into()))
         .await
         .unwrap();
-    assert_eq!(next_text(&mut socket).await, "40");
+    let connected = next_text(&mut socket).await;
+    assert!(connected.starts_with("40{"), "{connected}");
+    assert!(connected.contains("\"sid\""), "{connected}");
+    let version = next_text(&mut socket).await;
+    assert!(version.contains("on_server_version"), "{version}");
+    assert!(version.contains("\"major\":3"), "{version}");
+    assert!(version.contains("\"patch\":6"), "{version}");
     socket
 }
 

@@ -979,15 +979,40 @@ impl App {
             "videoConversion"
             | "storageTemplateMigration"
             | "migration"
-            | "smartSearch"
             | "duplicateDetection"
             | "metadataExtraction"
             | "sidecar"
             | "thumbnailGeneration"
-            | "faceDetection"
-            | "facialRecognition"
-            | "library"
-            | "ocr" => Ok(()),
+            | "library" => Ok(()),
+            "smartSearch" => {
+                let app = self.clone();
+                tokio::spawn(async move {
+                    crate::ml::encode_missing_clips(&app).await;
+                });
+                Ok(())
+            }
+            "faceDetection" => {
+                let app = self.clone();
+                tokio::spawn(async move {
+                    app.detect_missing_faces().await;
+                    app.recognize_unassigned_faces().await;
+                });
+                Ok(())
+            }
+            "facialRecognition" => {
+                let app = self.clone();
+                tokio::spawn(async move {
+                    app.recognize_unassigned_faces().await;
+                });
+                Ok(())
+            }
+            "ocr" => {
+                let app = self.clone();
+                tokio::spawn(async move {
+                    app.read_missing_ocr().await;
+                });
+                Ok(())
+            }
             "backupDatabase" => self.write_database_backup().await,
             other => Err(AdminFail::BadRequest(format!("Invalid job name: {other}"))),
         }

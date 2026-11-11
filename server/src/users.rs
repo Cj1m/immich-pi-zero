@@ -630,7 +630,7 @@ impl App {
     }
 
     /// Byte counts of the filesystem that holds `{data}/thumbs`.
-    /// The three text fields are those same counts, not a unit label.
+    /// The text fields are v3.3.6 `asHumanReadable` labels. The app prints those strings.
     pub(crate) fn storage_report(&self) -> Value {
         let thumbs = self.data_dir().join("thumbs");
         let _ = std::fs::create_dir_all(&thumbs);
@@ -647,9 +647,9 @@ impl App {
             text.parse::<f64>().unwrap_or(0.0)
         };
         json!({
-            "diskSize": total.to_string(),
-            "diskUse": used.to_string(),
-            "diskAvailable": available.to_string(),
+            "diskSize": human_readable_bytes(total),
+            "diskUse": human_readable_bytes(used),
+            "diskAvailable": human_readable_bytes(available),
             "diskSizeRaw": total,
             "diskUseRaw": used,
             "diskAvailableRaw": available,
@@ -1169,4 +1169,46 @@ fn disk_bytes(path: &Path) -> Option<(u64, u64, u64)> {
 
 fn width_u64(value: impl TryInto<u64>) -> u64 {
     value.try_into().unwrap_or(0)
+}
+
+/// Same labels as v3.3.6 `asHumanReadable`: 1024-based, one decimal past bytes.
+fn human_readable_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    let mut magnitude = 0usize;
+    let mut remainder = bytes as f64;
+    while remainder >= 1024.0 {
+        if magnitude + 1 < UNITS.len() {
+            magnitude += 1;
+            remainder /= 1024.0;
+        } else {
+            break;
+        }
+    }
+    if magnitude == 0 {
+        format!("{remainder:.0} {}", UNITS[magnitude])
+    } else {
+        format!("{remainder:.1} {}", UNITS[magnitude])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::human_readable_bytes;
+
+    #[test]
+    fn storage_labels_match_v3_3_6() {
+        assert_eq!(human_readable_bytes(0), "0 B");
+        assert_eq!(human_readable_bytes(500), "500 B");
+        assert_eq!(human_readable_bytes(300), "300 B");
+        assert_eq!(human_readable_bytes(500_000), "488.3 KiB");
+        assert_eq!(human_readable_bytes(300_000), "293.0 KiB");
+        assert_eq!(human_readable_bytes(500_000_000), "476.8 MiB");
+        assert_eq!(human_readable_bytes(300_000_000), "286.1 MiB");
+        assert_eq!(human_readable_bytes(500_000_000_000), "465.7 GiB");
+        assert_eq!(human_readable_bytes(300_000_000_000), "279.4 GiB");
+        assert_eq!(human_readable_bytes(500_000_000_000_000), "454.7 TiB");
+        assert_eq!(human_readable_bytes(300_000_000_000_000), "272.8 TiB");
+        assert_eq!(human_readable_bytes(500_000_000_000_000_000), "444.1 PiB");
+        assert_eq!(human_readable_bytes(300_000_000_000_000_000), "266.5 PiB");
+    }
 }

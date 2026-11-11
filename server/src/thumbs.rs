@@ -77,7 +77,7 @@ pub fn write_video_frame(data_dir: &Path, asset_id: &str, source: &Path) -> Opti
     let directory = data_dir.join("thumbs").join(asset_id);
     std::fs::create_dir_all(&directory).ok()?;
     let preview = directory.join("preview.jpg");
-    let status = std::process::Command::new("ffmpeg")
+    let output = match std::process::Command::new("ffmpeg")
         .arg("-y")
         .arg("-i")
         .arg(source)
@@ -88,10 +88,28 @@ pub fn write_video_frame(data_dir: &Path, asset_id: &str, source: &Path) -> Opti
         .arg(&preview)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
-    if !status.success() || !preview.exists() {
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("video poster: ffmpeg is not installed");
+            return None;
+        }
+        Err(error) => {
+            eprintln!("video poster: {error}");
+            return None;
+        }
+    };
+    if !output.status.success() || !preview.exists() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        let detail = detail
+            .char_indices()
+            .nth(400)
+            .map(|(index, _)| &detail[..index])
+            .unwrap_or(detail);
+        eprintln!("video poster: ffmpeg exited {} {detail}", output.status);
         return None;
     }
     let image = image::ImageReader::open(&preview)
@@ -117,7 +135,12 @@ pub fn remove_thumbs(data_dir: &Path, asset_id: &str) {
 }
 
 pub(crate) enum StillEdit {
-    Crop { x: u32, y: u32, width: u32, height: u32 },
+    Crop {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
     Rotate(u32),
     MirrorHorizontal,
     MirrorVertical,
@@ -177,8 +200,14 @@ fn decode_oriented(source: &Path, orientation: Option<u16>) -> Option<image::Dyn
 
 fn apply_still(image: image::DynamicImage, step: &StillEdit) -> Option<image::DynamicImage> {
     match step {
-        StillEdit::Crop { x, y, width, height } => {
-            if x.saturating_add(*width) > image.width() || y.saturating_add(*height) > image.height()
+        StillEdit::Crop {
+            x,
+            y,
+            width,
+            height,
+        } => {
+            if x.saturating_add(*width) > image.width()
+                || y.saturating_add(*height) > image.height()
             {
                 return None;
             }
