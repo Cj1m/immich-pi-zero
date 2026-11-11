@@ -2,3 +2,8 @@
 /data
 /server/target
 /reference
+.DS_Store
+.grok/
+.env
+immich.env
+*.key
