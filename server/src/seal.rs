@@ -92,7 +92,12 @@ impl ObjectKey {
         self.seal_file_chunked(src, dst, CHUNK_SIZE)
     }
 
-    fn seal_file_chunked(&self, src: &Path, dst: &Path, chunk_size: u32) -> std::io::Result<()> {
+    pub(crate) fn seal_file_chunked(
+        &self,
+        src: &Path,
+        dst: &Path,
+        chunk_size: u32,
+    ) -> std::io::Result<()> {
         if chunk_size == 0 || chunk_size > CHUNK_SIZE {
             return Err(std::io::Error::other("invalid seal chunk size"));
         }

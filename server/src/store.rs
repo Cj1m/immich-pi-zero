@@ -3,7 +3,6 @@
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -13,7 +12,7 @@ use chrono::Utc;
 use futures_util::{Stream, StreamExt};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
 use crate::config::{Config, S3Config};
@@ -760,40 +759,29 @@ impl S3Store {
                 }
             }
         };
+        let total = opened.plain_len;
         let slice_len = if opened.plain_len == 0 {
             0
         } else {
             end - start + 1
         };
+        // Headers go out once Backblaze accepts the range. Chunks follow as they arrive,
+        // so a player can start before the rest of the file is on the Pi.
         let body = if slice_len == 0 {
             Body::empty()
         } else {
-            let temp = self
-                .data_dir
-                .join("tmp")
-                .join(format!("open-{}", uuid::Uuid::new_v4()));
-            if let Some(parent) = temp.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|error| StoreError(error.to_string()))?;
-            }
-            if let Err(error) = self.write_plain(key, &opened, start, end, &temp).await {
-                let _ = tokio::fs::remove_file(&temp).await;
-                return Err(error);
-            }
-            let file = tokio::fs::File::open(&temp)
-                .await
-                .map_err(|error| StoreError(error.to_string()))?;
-            Body::from_stream(ReaderStream::new(
-                TempBody { file, path: temp }.take(slice_len),
-            ))
+            let span = chunk_span(&opened, start, end)?;
+            let response = self
+                .open_range(key, span.cipher_start, span.cipher_end)
+                .await?;
+            Body::from_stream(plain_chunks(BytePump::new(response), opened, start, end))
         };
         Ok(Some(build_response(
             body,
             ObjectSlice {
                 status,
                 slice_len,
-                total: opened.plain_len,
+                total,
                 partial: range_header.is_some(),
                 start,
                 end,
@@ -811,22 +799,15 @@ impl S3Store {
         end: u64,
         dest: &Path,
     ) -> Result<(), StoreError> {
-        let chunk = u64::from(opened.chunk_size);
-        let first = start / chunk;
-        let last = end / chunk;
-        let cipher_start = crate::seal::chunk_offset(opened.chunk_size, first)
-            .map_err(|error| StoreError(error.0))?;
-        let last_plain = crate::seal::chunk_plain_len(opened.plain_len, opened.chunk_size, last)
-            .map_err(|error| StoreError(error.0))?;
-        let last_offset = crate::seal::chunk_offset(opened.chunk_size, last)
-            .map_err(|error| StoreError(error.0))?;
-        let cipher_end = last_offset + last_plain + 16 - 1;
-        let response = self.open_range(key, cipher_start, cipher_end).await?;
+        let span = chunk_span(opened, start, end)?;
+        let response = self
+            .open_range(key, span.cipher_start, span.cipher_end)
+            .await?;
         let mut pump = BytePump::new(response);
         let mut file = tokio::fs::File::create(dest)
             .await
             .map_err(|error| StoreError(error.to_string()))?;
-        for index in first..=last {
+        for index in span.first..=span.last {
             let plain_len =
                 crate::seal::chunk_plain_len(opened.plain_len, opened.chunk_size, index)
                     .map_err(|error| StoreError(error.0))?;
@@ -889,32 +870,91 @@ impl S3Store {
     }
 }
 
+struct ChunkSpan {
+    first: u64,
+    last: u64,
+    cipher_start: u64,
+    cipher_end: u64,
+}
+
+fn chunk_span(opened: &crate::seal::Opened, start: u64, end: u64) -> Result<ChunkSpan, StoreError> {
+    let chunk = u64::from(opened.chunk_size);
+    let first = start / chunk;
+    let last = end / chunk;
+    let cipher_start = crate::seal::chunk_offset(opened.chunk_size, first)
+        .map_err(|error| StoreError(error.0))?;
+    let last_plain = crate::seal::chunk_plain_len(opened.plain_len, opened.chunk_size, last)
+        .map_err(|error| StoreError(error.0))?;
+    let last_offset = crate::seal::chunk_offset(opened.chunk_size, last)
+        .map_err(|error| StoreError(error.0))?;
+    let cipher_end = last_offset + last_plain + 16 - 1;
+    Ok(ChunkSpan {
+        first,
+        last,
+        cipher_start,
+        cipher_end,
+    })
+}
+
+struct ChunkRead {
+    pump: BytePump,
+    opened: crate::seal::Opened,
+    index: u64,
+    last: u64,
+    start: u64,
+    end: u64,
+}
+
+fn plain_chunks(
+    pump: BytePump,
+    opened: crate::seal::Opened,
+    start: u64,
+    end: u64,
+) -> impl Stream<Item = Result<Vec<u8>, std::io::Error>> + Send {
+    let chunk = u64::from(opened.chunk_size);
+    let state = ChunkRead {
+        pump,
+        opened,
+        index: start / chunk,
+        last: end / chunk,
+        start,
+        end,
+    };
+    futures_util::stream::try_unfold(state, |mut state| async move {
+        if state.index > state.last {
+            return Ok(None);
+        }
+        let index = state.index;
+        let plain_len =
+            crate::seal::chunk_plain_len(state.opened.plain_len, state.opened.chunk_size, index)
+                .map_err(|error| std::io::Error::other(error.0))?;
+        let wire = state
+            .pump
+            .read_exact((plain_len + 16) as usize)
+            .await
+            .map_err(|error| std::io::Error::other(error.0))?;
+        let plain = state
+            .opened
+            .decrypt_chunk(index, &wire)
+            .map_err(|error| std::io::Error::other(error.0))?;
+        let piece = crate::seal::overlap(
+            index,
+            state.opened.chunk_size,
+            state.start,
+            state.end,
+            &plain,
+        )
+        .to_vec();
+        state.index += 1;
+        Ok(Some((piece, state)))
+    })
+}
+
 struct DeletePath(PathBuf);
 
 impl Drop for DeletePath {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-struct TempBody {
-    file: tokio::fs::File,
-    path: PathBuf,
-}
-
-impl Drop for TempBody {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-impl AsyncRead for TempBody {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().file).poll_read(cx, buf)
     }
 }
 
@@ -930,6 +970,10 @@ impl BytePump {
             item.map(|chunk| chunk.as_ref().to_vec())
                 .map_err(|error| error.to_string())
         });
+        Self::from_stream(stream)
+    }
+
+    fn from_stream(stream: impl Stream<Item = Result<Vec<u8>, String>> + Send + 'static) -> Self {
         Self {
             stream: Box::pin(stream),
             pending: Vec::new(),
@@ -1009,4 +1053,96 @@ fn encode_segment(segment: &str) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{plain_chunks, BytePump};
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    fn sealed_wires(plain: &[u8], chunk: u32) -> (crate::seal::Opened, Vec<Vec<u8>>) {
+        let dir = std::env::temp_dir().join(format!(
+            "immich-seal-stream-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = crate::seal::ObjectKey::load_or_create(&dir.join("keys")).unwrap();
+        let src = dir.join("plain");
+        let dst = dir.join("sealed");
+        std::fs::write(&src, plain).unwrap();
+        key.seal_file_chunked(&src, &dst, chunk).unwrap();
+        let sealed = std::fs::read(&dst).unwrap();
+        let opened = key
+            .open_header(&sealed[..crate::seal::HEADER_LEN])
+            .unwrap();
+        let body = &sealed[crate::seal::HEADER_LEN..];
+        let wire = chunk as usize + 16;
+        let wires = body.chunks(wire).map(|chunk| chunk.to_vec()).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        (opened, wires)
+    }
+
+    fn wire_source(
+        rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) -> impl futures_util::Stream<Item = Result<Vec<u8>, String>> + Send {
+        futures_util::stream::unfold(rx, |mut rx| async move {
+            let chunk = rx.recv().await?;
+            Some((Ok(chunk), rx))
+        })
+    }
+
+    #[tokio::test]
+    async fn playback_yields_the_first_chunk_before_the_rest_arrives() {
+        let plain: Vec<u8> = (0..24).collect();
+        let (opened, wires) = sealed_wires(&plain, 8);
+        assert_eq!(wires.len(), 3);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(wires[0].clone()).await.unwrap();
+        let mut stream = std::pin::pin!(plain_chunks(
+            BytePump::from_stream(wire_source(rx)),
+            opened,
+            0,
+            23,
+        ));
+        let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("first chunk")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, plain[..8]);
+        let waiting = tokio::time::timeout(Duration::from_millis(50), stream.next()).await;
+        assert!(waiting.is_err(), "later chunks were read early");
+        tx.send(wires[1].clone()).await.unwrap();
+        tx.send(wires[2].clone()).await.unwrap();
+        drop(tx);
+        let second = stream.next().await.unwrap().unwrap();
+        let third = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+        assert_eq!([first, second, third].concat(), plain);
+    }
+
+    #[tokio::test]
+    async fn a_tail_range_does_not_wait_for_earlier_chunks() {
+        let plain: Vec<u8> = (0..24).collect();
+        let (opened, wires) = sealed_wires(&plain, 8);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(wires[2].clone()).await.unwrap();
+        drop(tx);
+        let mut stream = std::pin::pin!(plain_chunks(
+            BytePump::from_stream(wire_source(rx)),
+            opened,
+            16,
+            23,
+        ));
+        let tail = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("tail chunk")
+            .unwrap()
+            .unwrap();
+        assert_eq!(tail, plain[16..]);
+        assert!(stream.next().await.is_none());
+    }
 }
